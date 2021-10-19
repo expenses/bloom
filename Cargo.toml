@@ -8,6 +8,14 @@ resolver = "2"
 
 [dependencies]
 anyhow = "1.0.44"
+bytemuck = { version = "1.7.2", features = ["derive"] }
+gltf = { version = "0.16.0", default-features = false, features = ["utils"] }
+image = { version = "0.23.14", features = ["png"], default-features = false }
 pollster = "0.2.4"
-wgpu = "0.11.0"
+ultraviolet = { version = "0.8.1", features = ["bytemuck"] }
+wgpu = { version = "0.11.0", features = ["spirv"] }
 winit = "0.25.0"
+
+
+[workspace]
+members = [".", "compile-shaders", "shaders/rendering"]
