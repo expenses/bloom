@@ -116,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "colstodian",
  "dolly",
  "gltf",
  "image",
@@ -195,6 +196,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
 
 [[package]]
+name = "cint"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d83feae28854d73f33659f9018546157422ddf5b84264ce171a766d8547d77b"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "cocoa"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -240,6 +250,17 @@ name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
+name = "colstodian"
+version = "0.1.0-rc.4"
+source = "git+https://github.com/termhn/colstodian#f2fb0f55d94644dbb753edd5c01da9a08f0e2d3f"
+dependencies = [
+ "bytemuck",
+ "cint",
+ "glam 0.17.3",
+ "kolor",
+]
 
 [[package]]
 name = "compile-shaders"
@@ -608,6 +629,15 @@ dependencies = [
 
 [[package]]
 name = "glam"
+version = "0.17.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01732b97afd8508eee3333a541b9f7610f454bb818669e66e90f5f57c93a776"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "glam"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "525a3e490ba77b8e326fb67d4b44b4bd2f920f44d4cc73ccec50adc68e3bee34"
@@ -833,6 +863,14 @@ checksum = "8c2352bd1d0bceb871cb9d40f24360c8133c11d7486b68b5381c1dd1a32015e3"
 dependencies = [
  "libc",
  "libloading 0.7.1",
+]
+
+[[package]]
+name = "kolor"
+version = "0.1.6"
+source = "git+https://github.com/termhn/kolor?rev=5daf3d8#5daf3d8272e17038067024cb206154b4f8809b5a"
+dependencies = [
+ "glam 0.17.3",
 ]
 
 [[package]]

@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -106,7 +106,7 @@ fn main() -> anyhow::Result<()> {
             module: &fragment_module,
             entry_point: "fragment",
             targets: &[wgpu::ColorTargetState {
-                format: surface_format,
+                format: wgpu::TextureFormat::Rgba32Float,
                 write_mask: wgpu::ColorWrites::COLOR,
                 blend: None,
             }],
@@ -118,6 +118,45 @@ fn main() -> anyhow::Result<()> {
             stencil: Default::default(),
             bias: Default::default(),
         }),
+        multisample: wgpu::MultisampleState::default(),
+    });
+
+    let fullscreen_tri_module =
+        device.create_shader_module(&wgpu::include_spirv!("../shaders/fullscreen_tri.spv"));
+    let tonemap_module =
+        device.create_shader_module(&wgpu::include_spirv!("../shaders/tonemap.spv"));
+
+    let tonemap_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("tonemap pipeline layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[wgpu::PushConstantRange {
+            stages: wgpu::ShaderStages::FRAGMENT,
+            range: 0..128,
+        }],
+    });
+
+    let tonemap_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("tonemap pipeline"),
+        layout: Some(&tonemap_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &fullscreen_tri_module,
+            entry_point: "fullscreen_tri",
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &tonemap_module,
+            entry_point: "tonemap",
+            targets: &[wgpu::ColorTargetState {
+                format: surface_format,
+                write_mask: wgpu::ColorWrites::COLOR,
+                blend: None,
+            }],
+        }),
+        depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
     });
 
@@ -149,7 +188,9 @@ fn main() -> anyhow::Result<()> {
     let mut keyboard_state = KeyboardState::default();
 
     let mut camera = dolly::rig::CameraRig::builder()
-        .with(dolly::drivers::Position::new(dolly::glam::Vec3::new(2.0, 4.0, 1.0)))
+        .with(dolly::drivers::Position::new(dolly::glam::Vec3::new(
+            2.0, 4.0, 1.0,
+        )))
         .with(dolly::drivers::YawPitch::new().pitch_degrees(-74.0))
         .with(dolly::drivers::Smooth::new_position_rotation(0.5, 0.25))
         .build();
@@ -167,21 +208,24 @@ fn main() -> anyhow::Result<()> {
         0.1,
     );
 
-    let mut depth_buffer_view = device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth buffer"),
-            size: wgpu::Extent3d {
-                width: surface_configuration.width,
-                height: surface_configuration.height,
-                depth_or_array_layers: 1,
+    let mut depth_buffer_view = create_depth_buffer(&device, &surface_configuration);
+
+    let mut hdr_framebuffer_view = create_hdr_framebuffer(&device, &surface_configuration);
+
+    let mut tonemap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tonemap bind group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        })
-        .create_view(&Default::default());
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { event, .. } => match event {
@@ -202,21 +246,24 @@ fn main() -> anyhow::Result<()> {
                     0.1,
                 );
 
-                depth_buffer_view = device
-                    .create_texture(&wgpu::TextureDescriptor {
-                        label: Some("depth buffer"),
-                        size: wgpu::Extent3d {
-                            width: surface_configuration.width,
-                            height: surface_configuration.height,
-                            depth_or_array_layers: 1,
+                depth_buffer_view = create_depth_buffer(&device, &surface_configuration);
+
+                hdr_framebuffer_view = create_hdr_framebuffer(&device, &surface_configuration);
+
+                tonemap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("tonemap bind group"),
+                    layout: &bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
                         },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Depth32Float,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    })
-                    .create_view(&Default::default());
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                })
             }
             WindowEvent::KeyboardInput {
                 input:
@@ -315,7 +362,7 @@ fn main() -> anyhow::Result<()> {
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
                 color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
+                    view: &hdr_framebuffer_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -345,12 +392,80 @@ fn main() -> anyhow::Result<()> {
 
             drop(render_pass);
 
+            let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tonemap render pass"),
+                color_attachments: &[wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: true,
+                    },
+                }],
+                depth_stencil_attachment: None,
+            });
+
+            render_pass.set_pipeline(&tonemap_pipeline);
+            render_pass.set_bind_group(0, &tonemap_bind_group, &[]);
+            render_pass.set_push_constants(
+                wgpu::ShaderStages::FRAGMENT,
+                0,
+                bytemuck::bytes_of(&colstodian::tonemap::BakedLottesTonemapperParams::from(
+                    colstodian::tonemap::LottesTonemapperParams::default(),
+                )),
+            );
+            render_pass.draw(0..3, 0..1);
+
+            drop(render_pass);
+
             queue.submit(std::iter::once(command_encoder.finish()));
 
             texture.present();
         }
         _ => {}
     });
+}
+
+fn create_depth_buffer(
+    device: &wgpu::Device,
+    surface_configuration: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth buffer"),
+            size: wgpu::Extent3d {
+                width: surface_configuration.width,
+                height: surface_configuration.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        })
+        .create_view(&Default::default())
+}
+
+fn create_hdr_framebuffer(
+    device: &wgpu::Device,
+    surface_configuration: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("hdr framebuffer"),
+            size: wgpu::Extent3d {
+                width: surface_configuration.width,
+                height: surface_configuration.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        })
+        .create_view(&Default::default())
 }
 
 #[derive(Default)]
