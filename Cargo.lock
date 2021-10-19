@@ -116,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "dolly",
  "gltf",
  "image",
  "pollster",
@@ -544,6 +545,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "926871c31d0c0249a297472122bf3a696a3de54b674f4381d943fdd8efba2cd8"
+dependencies = [
+ "glam 0.18.0",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -595,6 +605,12 @@ dependencies = [
  "libc",
  "wasi",
 ]
+
+[[package]]
+name = "glam"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525a3e490ba77b8e326fb67d4b44b4bd2f920f44d4cc73ccec50adc68e3bee34"
 
 [[package]]
 name = "glam"
@@ -1578,7 +1594,7 @@ version = "0.4.0-alpha.12"
 source = "git+https://github.com/EmbarkStudios/rust-gpu#e2db97f899b3e07e450d8b53ca018b1a5d6d54b4"
 dependencies = [
  "bitflags",
- "glam",
+ "glam 0.19.0",
  "num-traits",
  "spirv-std-macros",
  "spirv-types",

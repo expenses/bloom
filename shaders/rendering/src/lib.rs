@@ -8,7 +8,7 @@
 // This needs to be here to provide `#[panic_handler]`.
 extern crate spirv_std;
 
-use spirv_std::glam::{Vec2, Vec3, Vec4, Mat4};
+use spirv_std::glam::{Mat4, Vec2, Vec3, Vec4};
 use spirv_std::{Image, Sampler};
 
 #[spirv(vertex)]

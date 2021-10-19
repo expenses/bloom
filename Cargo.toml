@@ -9,6 +9,7 @@ resolver = "2"
 [dependencies]
 anyhow = "1.0.44"
 bytemuck = { version = "1.7.2", features = ["derive"] }
+dolly = "0.1.3"
 gltf = { version = "0.16.0", default-features = false, features = ["utils"] }
 image = { version = "0.23.14", features = ["png"], default-features = false }
 pollster = "0.2.4"
