@@ -10,7 +10,7 @@ extern crate spirv_std;
 
 use spirv_std::glam::{IVec2, Mat4, UVec2, Vec2, Vec3, Vec4};
 use spirv_std::num_traits::Float;
-use spirv_std::{Image, RuntimeArray, Sampler, image::SampledImage};
+use spirv_std::{image::SampledImage, Image, RuntimeArray, Sampler};
 
 #[spirv(vertex)]
 pub fn vertex(
@@ -255,9 +255,7 @@ impl CombinedTextureSampler for (&Image!(2D, type = f32, sampled), &Sampler) {
 
 impl CombinedTextureSampler for &SampledImage<Image!(2D, type = f32, sampled)> {
     fn sample(&self, uv: Vec2, lod: f32) -> Vec4 {
-        unsafe {
-            self.sample_by_lod(uv, lod)
-        }
+        unsafe { self.sample_by_lod(uv, lod) }
     }
 }
 

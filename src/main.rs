@@ -510,45 +510,58 @@ fn main() -> anyhow::Result<()> {
 
                 // gui overlay
 
-                egui_platform.begin_frame();
+                if !cursor_grab {
+                    egui_platform.begin_frame();
 
-                egui::containers::Window::new("Controls").show(&egui_platform.context(), |ui| {
-                    ui.add(
-                        egui::widgets::Slider::new(&mut filter_constants.threshold, 0.0..=10.0)
-                            .text("Threshold"),
+                    egui::containers::Window::new("Controls").show(
+                        &egui_platform.context(),
+                        |ui| {
+                            ui.add(
+                                egui::widgets::Slider::new(
+                                    &mut filter_constants.threshold,
+                                    0.0..=10.0,
+                                )
+                                .text("Threshold"),
+                            );
+
+                            ui.add(
+                                egui::widgets::Slider::new(&mut filter_constants.knee, 0.0..=10.0)
+                                    .text("Knee"),
+                            )
+                        },
                     );
 
-                    ui.add(
-                        egui::widgets::Slider::new(&mut filter_constants.knee, 0.0..=10.0)
-                            .text("Knee"),
-                    )
-                });
+                    let (_output, paint_commands) = egui_platform.end_frame(Some(&window));
+                    let paint_jobs = egui_platform.context().tessellate(paint_commands);
 
-                let (_output, paint_commands) = egui_platform.end_frame(Some(&window));
-                let paint_jobs = egui_platform.context().tessellate(paint_commands);
-
-                let screen_descriptor = egui_wgpu_backend::ScreenDescriptor {
-                    physical_width: surface_configuration.width,
-                    physical_height: surface_configuration.height,
-                    scale_factor: window.scale_factor() as f32,
-                };
-                egui_render_pass.update_texture(
-                    &device,
-                    &queue,
-                    &egui_platform.context().texture(),
-                );
-                egui_render_pass.update_user_textures(&device, &queue);
-                egui_render_pass.update_buffers(&device, &queue, &paint_jobs, &screen_descriptor);
-
-                egui_render_pass
-                    .execute(
-                        &mut command_encoder,
-                        &texture_view,
+                    let screen_descriptor = egui_wgpu_backend::ScreenDescriptor {
+                        physical_width: surface_configuration.width,
+                        physical_height: surface_configuration.height,
+                        scale_factor: window.scale_factor() as f32,
+                    };
+                    egui_render_pass.update_texture(
+                        &device,
+                        &queue,
+                        &egui_platform.context().texture(),
+                    );
+                    egui_render_pass.update_user_textures(&device, &queue);
+                    egui_render_pass.update_buffers(
+                        &device,
+                        &queue,
                         &paint_jobs,
                         &screen_descriptor,
-                        None,
-                    )
-                    .unwrap();
+                    );
+
+                    egui_render_pass
+                        .execute(
+                            &mut command_encoder,
+                            &texture_view,
+                            &paint_jobs,
+                            &screen_descriptor,
+                            None,
+                        )
+                        .unwrap();
+                }
 
                 queue.submit(std::iter::once(command_encoder.finish()));
 
