@@ -135,7 +135,7 @@ fn quadratic_colour_thresholding(color: Vec3, threshold: f32, knee: f32) -> Vec3
 }
 
 fn calculate_texel_size_and_uv(
-    texture: &Image!(2D, format=rgba32f, sampled=false),
+    texture: &Image!(2D, format=rgba16f, sampled=false),
     id: IVec2,
 ) -> (Vec2, Vec2) {
     let output_size: UVec2 = texture.query_size();
@@ -157,7 +157,7 @@ pub fn downsample_initial(
     #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] bloom_texture_mips: &RuntimeArray<
-        Image!(2D, format=rgba32f, sampled=false),
+        Image!(2D, format=rgba16f, sampled=false),
     >,
     #[spirv(global_invocation_id)] id: IVec2,
     #[spirv(push_constant)] filter_constants: &FilterConstants,
@@ -182,7 +182,7 @@ pub fn downsample(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
-        Image!(2D, format=rgba32f, sampled=false),
+        Image!(2D, format=rgba16f, sampled=false),
     >,
     #[spirv(global_invocation_id)] id: IVec2,
     #[spirv(push_constant)] source_mip: &u32,
@@ -205,7 +205,7 @@ pub fn upsample(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
-        Image!(2D, format=rgba32f, sampled=false),
+        Image!(2D, format=rgba16f, sampled=false),
     >,
     #[spirv(global_invocation_id)] id: IVec2,
     #[spirv(push_constant)] dest_mip: &u32,
@@ -229,7 +229,7 @@ pub fn upsample(
 pub fn upsample_final(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
-    #[spirv(descriptor_set = 1, binding = 0)] hdr_texture: &Image!(2D, format=rgba32f, sampled=false),
+    #[spirv(descriptor_set = 1, binding = 0)] hdr_texture: &Image!(2D, format=rgba16f, sampled=false),
     #[spirv(global_invocation_id)] id: IVec2,
 ) {
     let (texel_size, uv) = calculate_texel_size_and_uv(&hdr_texture, id);
