@@ -10,7 +10,7 @@ extern crate spirv_std;
 
 use spirv_std::glam::{IVec2, Mat4, UVec2, Vec2, Vec3, Vec4};
 use spirv_std::num_traits::Float;
-use spirv_std::{Image, RuntimeArray, Sampler};
+use spirv_std::{Image, RuntimeArray, Sampler, image::SampledImage};
 
 #[spirv(vertex)]
 pub fn vertex(
@@ -165,7 +165,7 @@ pub fn downsample_initial(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&bloom_texture, id);
 
-    let sample = sample_13_tap_box(hdr_texture, *sampler, uv, texel_size, 0);
+    let sample = sample_13_tap_box((hdr_texture, sampler), uv, texel_size, 0);
 
     let thresholded =
         quadratic_colour_thresholding(sample, filter_constants.threshold, filter_constants.knee);
@@ -190,7 +190,7 @@ pub fn downsample(
     let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
 
     let sample =
-        sample_13_tap_box(source_texture, *sampler, uv, texel_size, *source_mip).extend(1.0);
+        sample_13_tap_box((source_texture, sampler), uv, texel_size, *source_mip).extend(1.0);
 
     unsafe {
         destination_texture.write(id, sample);
@@ -212,7 +212,7 @@ pub fn upsample(
     let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
 
     let sample =
-        sample_3x3_tent(source_texture, *sampler, uv, texel_size, *dest_mip + 1).extend(1.0);
+        sample_3x3_tent((source_texture, sampler), uv, texel_size, *dest_mip + 1).extend(1.0);
 
     let existing_sample: Vec4 = destination_texture.read(id);
 
@@ -230,7 +230,7 @@ pub fn upsample_final(
 ) {
     let (texel_size, uv) = calculate_texel_size_and_uv(&hdr_texture, id);
 
-    let sample = sample_3x3_tent(source_texture, *sampler, uv, texel_size, 0).extend(1.0);
+    let sample = sample_3x3_tent((source_texture, sampler), uv, texel_size, 0).extend(1.0);
 
     let existing_sample: Vec4 = hdr_texture.read(id);
 
@@ -239,14 +239,26 @@ pub fn upsample_final(
     }
 }
 
-fn sample_vec3_at_lod(
-    texture: &Image!(2D, type=f32, sampled),
-    sampler: Sampler,
-    uv: Vec2,
-    lod: u32,
-) -> Vec3 {
-    let sample: Vec4 = texture.sample_by_lod(sampler, uv, lod as f32);
-    sample.truncate()
+trait CombinedTextureSampler {
+    fn sample(&self, uv: Vec2, lod: f32) -> Vec4;
+
+    fn sample_vec3_by_lod(&self, uv: Vec2, lod: u32) -> Vec3 {
+        self.sample(uv, lod as f32).truncate()
+    }
+}
+
+impl CombinedTextureSampler for (&Image!(2D, type = f32, sampled), &Sampler) {
+    fn sample(&self, uv: Vec2, lod: f32) -> Vec4 {
+        self.0.sample_by_lod(*self.1, uv, lod)
+    }
+}
+
+impl CombinedTextureSampler for &SampledImage<Image!(2D, type = f32, sampled)> {
+    fn sample(&self, uv: Vec2, lod: f32) -> Vec4 {
+        unsafe {
+            self.sample_by_lod(uv, lod)
+        }
+    }
 }
 
 // Take 13 samples in a grid around the center pixel:
@@ -260,26 +272,25 @@ fn sample_vec3_at_lod(
 // These samples are interpreted as 4 overlapping boxes
 // plus a center box to produce a box blur.
 #[rustfmt::skip]
-fn sample_13_tap_box(
-    texture: &Image!(2D, type=f32, sampled),
-    sampler: Sampler,
+fn sample_13_tap_box<T: CombinedTextureSampler>(
+    texture: T,
     uv: Vec2,
     texel_size: Vec2,
     lod: u32,
 ) -> Vec3 {
-    let a = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, -1.0), lod);
-    let b = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, -1.0),  lod);
-    let c = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, -1.0),  lod);
-    let d = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-0.5, -0.5), lod);
-    let e = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.5, -0.5),  lod);
-    let f = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 0.0),  lod);
-    let g = sample_vec3_at_lod(texture, sampler, uv, lod);
-    let h = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 0.0),  lod);
-    let i = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-0.5, 0.5), lod);
-    let j = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.5, 0.5),  lod);
-    let k = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 1.0), lod);
-    let l = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, 1.0),  lod);
-    let m = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 1.0),  lod);
+    let a = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-1.0, -1.0), lod);
+    let b = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(0.0, -1.0),  lod);
+    let c = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(1.0, -1.0),  lod);
+    let d = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-0.5, -0.5), lod);
+    let e = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(0.5, -0.5),  lod);
+    let f = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-1.0, 0.0),  lod);
+    let g = texture.sample_vec3_by_lod(uv, lod);
+    let h = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(1.0, 0.0),  lod);
+    let i = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-0.5, 0.5), lod);
+    let j = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(0.5, 0.5),  lod);
+    let k = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-1.0, 1.0), lod);
+    let l = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(0.0, 1.0),  lod);
+    let m = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(1.0, 1.0),  lod);
 
     let center_pixels = d + e + i + j;
 
@@ -297,22 +308,21 @@ fn sample_13_tap_box(
 // 1/16 * d*2 e*4 f*2
 //        g*1 h*2 i*1
 #[rustfmt::skip]
-fn sample_3x3_tent(
-    texture: &Image!(2D, type = f32, sampled),
-    sampler: Sampler,
+fn sample_3x3_tent<T: CombinedTextureSampler>(
+    texture: T,
     uv: Vec2,
     texel_size: Vec2,
     lod: u32
 ) -> Vec3 {
-    let a = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, -1.0), lod);
-    let b = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, -1.0),  lod);
-    let c = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, -1.0),  lod);
-    let d = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 0.0),  lod);
-    let e = sample_vec3_at_lod(texture, sampler, uv, lod);
-    let f = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 0.0),  lod);
-    let g = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 1.0), lod);
-    let h = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, 1.0),  lod);
-    let i = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 1.0),  lod);
+    let a = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-1.0, -1.0), lod);
+    let b = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(0.0, -1.0),  lod);
+    let c = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(1.0, -1.0),  lod);
+    let d = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-1.0, 0.0),  lod);
+    let e = texture.sample_vec3_by_lod(uv, lod);
+    let f = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(1.0, 0.0),  lod);
+    let g = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(-1.0, 1.0), lod);
+    let h = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(0.0, 1.0),  lod);
+    let i = texture.sample_vec3_by_lod(uv + texel_size * Vec2::new(1.0, 1.0),  lod);
 
     ((a + c + g + i) + (b + d + f + h) * 2.0 + e * 4.0) / 16.0
 }
