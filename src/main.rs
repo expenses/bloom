@@ -35,6 +35,8 @@ fn main() -> anyhow::Result<()> {
                 | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
                 | wgpu::Features::SPIRV_SHADER_PASSTHROUGH,
             limits: wgpu::Limits {
+                // AMD gpus have the lowest max push constant size, at 128 bytes. We don't use this entire size, but setting it to the max is just easier.
+                // https://vulkan.gpuinfo.org/displaydevicelimit.php?name=maxPushConstantsSize&platform=all
                 max_push_constant_size: 128,
                 max_storage_textures_per_shader_stage: MAX_MIPS,
                 ..Default::default()
@@ -55,34 +57,11 @@ fn main() -> anyhow::Result<()> {
 
     surface.configure(&device, &surface_configuration);
 
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("bind group layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Sampler {
-                    filtering: true,
-                    comparison: false,
-                },
-                count: None,
-            },
-        ],
-    });
+    let bind_group_layouts = BindGroupLayouts::new(&device);
 
     let base_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("base pipeline layout"),
-        bind_group_layouts: &[&bind_group_layout],
+        bind_group_layouts: &[&bind_group_layouts.sampled_texture],
         push_constant_ranges: &[wgpu::PushConstantRange {
             stages: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             range: 0..128,
@@ -165,98 +144,7 @@ fn main() -> anyhow::Result<()> {
         multisample: wgpu::MultisampleState::default(),
     });
 
-    let bloom_texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("bloom texture bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::StorageTexture {
-                access: wgpu::StorageTextureAccess::ReadWrite,
-                format: wgpu::TextureFormat::Rgba32Float,
-                view_dimension: wgpu::TextureViewDimension::D2,
-            },
-            count: Some(core::num::NonZeroU32::new(MAX_MIPS).unwrap()),
-        }],
-    });
-
-    let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("bloom pipeline layout"),
-        bind_group_layouts: &[&bind_group_layout, &bloom_texture_bgl],
-        push_constant_ranges: &[wgpu::PushConstantRange {
-            stages: wgpu::ShaderStages::COMPUTE,
-            range: 0..128,
-        }],
-    });
-
-    let pre_filter_module = unsafe {
-        device.create_shader_module_spirv(&wgpu::include_spirv_raw!(
-            "../shaders/downsample_pre_filter.spv"
-        ))
-    };
-
-    let pre_filter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("pre filter pipeline"),
-        layout: Some(&bloom_pipeline_layout),
-        module: &pre_filter_module,
-        entry_point: "downsample_pre_filter",
-    });
-
-    let downsample_module = unsafe {
-        device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/downsample.spv"))
-    };
-
-    let downsample_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("downsample pipeline"),
-        layout: Some(&bloom_pipeline_layout),
-        module: &downsample_module,
-        entry_point: "downsample",
-    });
-
-    let upsample_module = unsafe {
-        device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/upsample.spv"))
-    };
-
-    let upsample_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("upsample pipeline"),
-        layout: Some(&bloom_pipeline_layout),
-        module: &upsample_module,
-        entry_point: "upsample",
-    });
-
-    let upsample_final_module = unsafe {
-        device
-            .create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/upsample_final.spv"))
-    };
-
-    let single_storage_texture_bgl =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("single storage texture bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::ReadWrite,
-                    format: wgpu::TextureFormat::Rgba32Float,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            }],
-        });
-
-    let upsample_final_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("upsample final pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout, &single_storage_texture_bgl],
-            push_constant_ranges: &[],
-        });
-
-    let upsample_final_pipeline =
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("upsample final pipeline"),
-            layout: Some(&upsample_final_pipeline_layout),
-            module: &upsample_final_module,
-            entry_point: "upsample_final",
-        });
+    let compute_pipelines = ComputePipelines::new(&device, &bind_group_layouts);
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("sampler"),
@@ -270,7 +158,7 @@ fn main() -> anyhow::Result<()> {
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("bind group"),
-        layout: &bind_group_layout,
+        layout: &bind_group_layouts.sampled_texture,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -312,7 +200,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut hdr_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hdr texture bind group"),
-        layout: &bind_group_layout,
+        layout: &bind_group_layouts.sampled_texture,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -327,7 +215,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut hdr_texture_storage_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hdr texture storage bind group"),
-        layout: &single_storage_texture_bgl,
+        layout: &bind_group_layouts.storage_texture,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
             resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
@@ -337,21 +225,19 @@ fn main() -> anyhow::Result<()> {
     let mut bloom_mips =
         bloom_mips_for_dimensions(surface_configuration.width, surface_configuration.height);
 
-    let mut mip_chain_a = MipChain::new(
+    let mut bloom_texture_a = BloomTextureWithMips::new(
         &device,
         &surface_configuration,
         bloom_mips,
-        &bloom_texture_bgl,
-        &bind_group_layout,
+        &bind_group_layouts,
         &sampler,
     );
 
-    let mut mip_chain_b = MipChain::new(
+    let mut bloom_texture_b = BloomTextureWithMips::new(
         &device,
         &surface_configuration,
         bloom_mips,
-        &bloom_texture_bgl,
-        &bind_group_layout,
+        &bind_group_layouts,
         &sampler,
     );
 
@@ -399,7 +285,7 @@ fn main() -> anyhow::Result<()> {
 
                     hdr_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("hdr texture bind group"),
-                        layout: &bind_group_layout,
+                        layout: &bind_group_layouts.sampled_texture,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
@@ -415,7 +301,7 @@ fn main() -> anyhow::Result<()> {
                     hdr_texture_storage_bind_group =
                         device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("hdr texture storage bind group"),
-                            layout: &single_storage_texture_bgl,
+                            layout: &bind_group_layouts.storage_texture,
                             entries: &[wgpu::BindGroupEntry {
                                 binding: 0,
                                 resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
@@ -427,21 +313,19 @@ fn main() -> anyhow::Result<()> {
                         surface_configuration.height,
                     );
 
-                    mip_chain_a = MipChain::new(
+                    bloom_texture_a = BloomTextureWithMips::new(
                         &device,
                         &surface_configuration,
                         bloom_mips,
-                        &bloom_texture_bgl,
-                        &bind_group_layout,
+                        &bind_group_layouts,
                         &sampler,
                     );
 
-                    mip_chain_b = MipChain::new(
+                    bloom_texture_b = BloomTextureWithMips::new(
                         &device,
                         &surface_configuration,
                         bloom_mips,
-                        &bloom_texture_bgl,
-                        &bind_group_layout,
+                        &bind_group_layouts,
                         &sampler,
                     );
                 }
@@ -581,9 +465,9 @@ fn main() -> anyhow::Result<()> {
                         label: Some("compute pass"),
                     });
 
-                compute_pass.set_pipeline(&pre_filter_pipeline);
+                compute_pass.set_pipeline(&compute_pipelines.downsample_initial);
                 compute_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
-                compute_pass.set_bind_group(1, &mip_chain_a.storage_mips_bind_group, &[]);
+                compute_pass.set_bind_group(1, &bloom_texture_a.storage_mips_bind_group, &[]);
                 compute_pass.set_push_constants(0, bytemuck::bytes_of(&filter_constants));
                 compute_pass.dispatch(
                     dispatch_count(surface_configuration.width >> 1, 8),
@@ -591,11 +475,16 @@ fn main() -> anyhow::Result<()> {
                     1,
                 );
 
-                compute_pass.set_pipeline(&downsample_pipeline);
+                compute_pass.set_pipeline(&compute_pipelines.downsample);
+
+                // We have to ping-pong between textures because webgpu doesn't allow
+                // having the same texture bound as both a storage texture and sampled texture.
+                //
+                // This is pretty wasteful as we only use half the mips of each texture.
 
                 for i in 0..bloom_mips - 1 {
-                    let mut src = &mip_chain_a;
-                    let mut dst = &mip_chain_b;
+                    let mut src = &bloom_texture_a;
+                    let mut dst = &bloom_texture_b;
 
                     if i % 2 == 1 {
                         std::mem::swap(&mut src, &mut dst);
@@ -611,11 +500,11 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                compute_pass.set_pipeline(&upsample_pipeline);
+                compute_pass.set_pipeline(&compute_pipelines.upsample);
 
                 for i in (0..bloom_mips - 1).rev() {
-                    let mut src = &mip_chain_a;
-                    let mut dst = &mip_chain_b;
+                    let mut src = &bloom_texture_a;
+                    let mut dst = &bloom_texture_b;
 
                     if i % 2 == 0 {
                         std::mem::swap(&mut src, &mut dst);
@@ -631,8 +520,8 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                compute_pass.set_pipeline(&upsample_final_pipeline);
-                compute_pass.set_bind_group(0, &mip_chain_a.sampled_texture_bind_group, &[]);
+                compute_pass.set_pipeline(&compute_pipelines.upsample_final);
+                compute_pass.set_bind_group(0, &bloom_texture_a.sampled_texture_bind_group, &[]);
                 compute_pass.set_bind_group(1, &hdr_texture_storage_bind_group, &[]);
                 compute_pass.dispatch(
                     dispatch_count(surface_configuration.width, 8),
@@ -671,7 +560,7 @@ fn main() -> anyhow::Result<()> {
 
                 drop(render_pass);
 
-                // gui
+                // gui overlay
 
                 egui_platform.begin_frame();
 
@@ -722,6 +611,151 @@ fn main() -> anyhow::Result<()> {
     });
 }
 
+struct BindGroupLayouts {
+    sampled_texture: wgpu::BindGroupLayout,
+    storage_texture: wgpu::BindGroupLayout,
+    bloom_texture: wgpu::BindGroupLayout,
+}
+
+impl BindGroupLayouts {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            bloom_texture: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bloom texture bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::ReadWrite,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: Some(core::num::NonZeroU32::new(MAX_MIPS).unwrap()),
+                }],
+            }),
+            storage_texture: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("storage texture bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::ReadWrite,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                }],
+            }),
+            sampled_texture: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sampled texture bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler {
+                            filtering: true,
+                            comparison: false,
+                        },
+                        count: None,
+                    },
+                ],
+            }),
+        }
+    }
+}
+
+struct ComputePipelines {
+    downsample_initial: wgpu::ComputePipeline,
+    downsample: wgpu::ComputePipeline,
+    upsample: wgpu::ComputePipeline,
+    upsample_final: wgpu::ComputePipeline,
+}
+
+impl ComputePipelines {
+    fn new(device: &wgpu::Device, bind_group_layouts: &BindGroupLayouts) -> Self {
+        let downsample_initial_module = unsafe {
+            device.create_shader_module_spirv(&wgpu::include_spirv_raw!(
+                "../shaders/downsample_initial.spv"
+            ))
+        };
+
+        let downsample_module = unsafe {
+            device
+                .create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/downsample.spv"))
+        };
+
+        let upsample_module = unsafe {
+            device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/upsample.spv"))
+        };
+
+        let upsample_final_module = unsafe {
+            device.create_shader_module_spirv(&wgpu::include_spirv_raw!(
+                "../shaders/upsample_final.spv"
+            ))
+        };
+
+        let bloom_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("bloom pipeline layout"),
+                bind_group_layouts: &[
+                    &bind_group_layouts.sampled_texture,
+                    &bind_group_layouts.bloom_texture,
+                ],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..128,
+                }],
+            });
+
+        let upsample_final_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("upsample final pipeline layout"),
+                bind_group_layouts: &[
+                    &bind_group_layouts.sampled_texture,
+                    &bind_group_layouts.storage_texture,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        Self {
+            downsample_initial: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("downsample initial pipeline"),
+                layout: Some(&bloom_pipeline_layout),
+                module: &downsample_initial_module,
+                entry_point: "downsample_initial",
+            }),
+            downsample: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("downsample pipeline"),
+                layout: Some(&bloom_pipeline_layout),
+                module: &downsample_module,
+                entry_point: "downsample",
+            }),
+            upsample: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("upsample pipeline"),
+                layout: Some(&bloom_pipeline_layout),
+                module: &upsample_module,
+                entry_point: "upsample",
+            }),
+            upsample_final: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("upsample final pipeline"),
+                layout: Some(&upsample_final_pipeline_layout),
+                module: &upsample_final_module,
+                entry_point: "upsample_final",
+            }),
+        }
+    }
+}
+
 fn create_depth_buffer(
     device: &wgpu::Device,
     surface_configuration: &wgpu::SurfaceConfiguration,
@@ -766,18 +800,19 @@ fn create_hdr_framebuffer(
         .create_view(&Default::default())
 }
 
-struct MipChain {
+// Represented as a bind group containing an array of storage texture views
+// for each mip as well as a bind group containing a sampled view with all mips.
+struct BloomTextureWithMips {
     storage_mips_bind_group: wgpu::BindGroup,
     sampled_texture_bind_group: wgpu::BindGroup,
 }
 
-impl MipChain {
+impl BloomTextureWithMips {
     fn new(
         device: &wgpu::Device,
         surface_configuration: &wgpu::SurfaceConfiguration,
         mip_levels: u32,
-        bloom_texture_bgl: &wgpu::BindGroupLayout,
-        sampled_texture_bgl: &wgpu::BindGroupLayout,
+        bind_group_layouts: &BindGroupLayouts,
         sampler: &wgpu::Sampler,
     ) -> Self {
         let width = (surface_configuration.width / 2).max(1);
@@ -817,7 +852,7 @@ impl MipChain {
         Self {
             storage_mips_bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("bloom storage mips bind group"),
-                layout: bloom_texture_bgl,
+                layout: &bind_group_layouts.bloom_texture,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureViewArray(&view_refs),
@@ -825,7 +860,7 @@ impl MipChain {
             }),
             sampled_texture_bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("bloom sample texture bind group"),
-                layout: sampled_texture_bgl,
+                layout: &bind_group_layouts.sampled_texture,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -974,12 +1009,10 @@ fn load_texture_from_gltf(
         .create_view(&Default::default()))
 }
 
-// https://github.com/bevyengine/bevy/blob/2c11ca0291f94b14ee32883d40f8243f3c8e3d6c/pipelined/bevy_hdr/src/bloom_node.rs#L292-L297
 fn bloom_mips_for_dimensions(width: u32, height: u32) -> u32 {
-    let min_element = width.min(height) / 2;
     let mut mips = 1;
 
-    while (min_element >> mips) > 0 {
+    while (width.min(height) >> (mips + 1)) > 0 {
         mips += 1;
     }
 

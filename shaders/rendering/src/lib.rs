@@ -59,12 +59,10 @@ pub fn fullscreen_tri(
     uv: &mut Vec2,
     #[spirv(position)] builtin_pos: &mut Vec4,
 ) {
-    // Create a "full screen triangle" by mapping the vertex index.
-    // ported from https://www.saschawillems.de/blog/2016/08/13/vulkan-tutorial-on-rendering-a-fullscreen-quad-without-buffers/
     *uv = Vec2::new(((vert_idx << 1) & 2) as f32, (vert_idx & 2) as f32);
     let pos = 2.0 * *uv - Vec2::ONE;
 
-    *builtin_pos = pos.extend(0.0).extend(1.0);
+    *builtin_pos = Vec4::new(pos.x, pos.y, 0.0, 1.0);
 
     // Flipped on Y for webgpu.
     uv.y = 1.0 - uv.y;
@@ -110,11 +108,31 @@ pub struct BakedLottesTonemapperParams {
     cross_saturation: f32,
 }
 
-// https://github.com/bevyengine/bevy/blob/2c11ca0291f94b14ee32883d40f8243f3c8e3d6c/pipelined/bevy_hdr/src/bloom.wgsl
-
-// https://github.com/Unity-Technologies/Graphics/blob/master/com.unity.postprocessing/PostProcessing/Shaders/Builtins/Bloom.shader
-
 // http://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare
+
+// Use a quadratic curve to threshold the colour.
+// Taken from:
+// https://github.com/Unity-Technologies/Graphics/blob/3c410483bdb6d6f4ced6ba10500b05b6c25ca87f/com.unity.postprocessing/PostProcessing/Shaders/Colors.hlsl#L238-L255
+//
+// More info:
+//
+// https://github.com/Unity-Technologies/Graphics/blob/3c410483bdb6d6f4ced6ba10500b05b6c25ca87f/com.unity.postprocessing/PostProcessing/Runtime/Effects/Bloom.cs#L23-L35
+fn quadratic_colour_thresholding(color: Vec3, threshold: f32, knee: f32) -> Vec3 {
+    fn clamp(value: f32, min: f32, max: f32) -> f32 {
+        value.max(min).min(max)
+    }
+
+    let curve = Vec3::new(threshold - knee, knee * 2.0, 0.25 / knee);
+
+    let brightness = color.max_element();
+
+    // Under-threshold part: quadratic curve
+    let mut rq = clamp(brightness - curve.x, 0.0, curve.y);
+    rq = curve.z * rq * rq;
+
+    // Combine and apply the brightness response curve.
+    color * rq.max(brightness - threshold) / brightness.max(core::f32::EPSILON)
+}
 
 fn calculate_texel_size_and_uv(
     texture: &Image!(2D, format=rgba32f, sampled=false),
@@ -122,6 +140,7 @@ fn calculate_texel_size_and_uv(
 ) -> (Vec2, Vec2) {
     let output_size: UVec2 = texture.query_size();
     let texel_size = Vec2::splat(1.0) / output_size.as_vec2();
+    // Offset the uv by half a texel as we want to sample from the middle, not a corner.
     let uv = (id.as_vec2() + Vec2::splat(0.5)) * texel_size;
 
     (texel_size, uv)
@@ -133,7 +152,7 @@ pub struct FilterConstants {
 }
 
 #[spirv(compute(threads(8, 8, 1)))]
-pub fn downsample_pre_filter(
+pub fn downsample_initial(
     #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] bloom_texture_mips: &RuntimeArray<
@@ -148,7 +167,7 @@ pub fn downsample_pre_filter(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&bloom_texture, id);
 
-    let sample = downsample_box_13_tap(hdr_texture, *sampler, uv, texel_size, 0);
+    let sample = sample_13_tap_box(hdr_texture, *sampler, uv, texel_size, 0);
 
     let thresholded =
         quadratic_colour_thresholding(sample, filter_constants.threshold, filter_constants.knee);
@@ -175,7 +194,7 @@ pub fn downsample(
     let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
 
     let sample =
-        downsample_box_13_tap(source_texture, *sampler, uv, texel_size, *source_mip).extend(1.0);
+        sample_13_tap_box(source_texture, *sampler, uv, texel_size, *source_mip).extend(1.0);
 
     unsafe {
         destination_texture.write(id, sample);
@@ -238,6 +257,7 @@ fn sample_vec3_at_lod(
     sample.truncate()
 }
 
+// Take 13 samples in a grid around the center pixel:
 // . . . . . . .
 // . A . B . C .
 // . . D . E . .
@@ -245,8 +265,10 @@ fn sample_vec3_at_lod(
 // . . I . J . .
 // . K . L . M .
 // . . . . . . .
+// These samples are interpreted as 4 overlapping boxes
+// plus a center box to produce a box blur.
 #[rustfmt::skip]
-fn downsample_box_13_tap(
+fn sample_13_tap_box(
     texture: &Image!(2D, type=f32, sampled),
     sampler: Sampler,
     uv: Vec2,
@@ -277,9 +299,11 @@ fn downsample_box_13_tap(
     center_pixels * 0.25 * 0.5 + (top_left + top_right + bottom_left + bottom_right) * 0.25 * 0.125
 }
 
-//        1 2 1
-// 1/16 * 2 4 2
-//        1 2 1
+// Sample in a 3x3 grid but with weights to produce a tent filter:
+//
+//        a*1 b*2 c*1
+// 1/16 * d*2 e*4 f*2
+//        g*1 h*2 i*1
 #[rustfmt::skip]
 fn sample_3x3_tent(
     texture: &Image!(2D, type = f32, sampled),
@@ -288,38 +312,15 @@ fn sample_3x3_tent(
     texel_size: Vec2,
     lod: u32
 ) -> Vec3 {
-
     let a = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, -1.0), lod);
-    let b = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, -1.0),  lod) * 2.0;
+    let b = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, -1.0),  lod);
     let c = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, -1.0),  lod);
-    let d = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 0.0),  lod) * 2.0;
-    let e = sample_vec3_at_lod(texture, sampler, uv, lod) * 4.0;
-    let f = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 0.0),  lod) * 2.0;
+    let d = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 0.0),  lod);
+    let e = sample_vec3_at_lod(texture, sampler, uv, lod);
+    let f = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 0.0),  lod);
     let g = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 1.0), lod);
-    let h = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, 1.0),  lod) * 2.0;
+    let h = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, 1.0),  lod);
     let i = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 1.0),  lod);
 
-    (a + b + c + d + e + f + g + h + i) / 16.0
-}
-
-//
-// Quadratic color thresholding
-// curve = (threshold - knee, knee * 2, 0.25 / knee)
-//
-fn quadratic_colour_thresholding(color: Vec3, threshold: f32, knee: f32) -> Vec3 {
-    let curve = Vec3::new(threshold - knee, knee * 2.0, 0.25 / knee);
-
-    // Pixel brightness
-    let brightness = color.max_element();
-
-    // Under-threshold part: quadratic curve
-    let mut rq = clamp(brightness - curve.x, 0.0, curve.y);
-    rq = curve.z * rq * rq;
-
-    // Combine and apply the brightness response curve.
-    color * rq.max(brightness - threshold) / brightness.max(core::f32::EPSILON)
-}
-
-fn clamp(value: f32, min: f32, max: f32) -> f32 {
-    value.max(min).min(max)
+    ((a + c + g + i) + (b + d + f + h) * 2.0 + e * 4.0) / 16.0
 }
