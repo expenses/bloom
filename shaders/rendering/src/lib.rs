@@ -8,7 +8,7 @@
 // This needs to be here to provide `#[panic_handler]`.
 extern crate spirv_std;
 
-use spirv_std::glam::{IVec2, IVec3, Mat4, UVec2, UVec3, Vec2, Vec3, Vec4};
+use spirv_std::glam::{IVec2, IVec3, Mat4, UVec2, Vec2, Vec3, Vec4};
 use spirv_std::num_traits::Float;
 use spirv_std::{Image, RuntimeArray, Sampler};
 
@@ -116,28 +116,125 @@ pub struct BakedLottesTonemapperParams {
 
 // http://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare
 
+fn calculate_texel_size_and_uv(
+    texture: &Image!(2D, format=rgba32f, sampled=false),
+    id: IVec2,
+) -> (Vec2, Vec2) {
+    let output_size: UVec2 = texture.query_size();
+    let texel_size = Vec2::splat(1.0) / output_size.as_vec2();
+    let uv = (id.as_vec2() + Vec2::splat(0.5)) * texel_size;
+
+    (texel_size, uv)
+}
+
+pub struct FilterConstants {
+    threshold: f32,
+    knee: f32,
+}
+
 #[spirv(compute(threads(8, 8, 1)))]
 pub fn downsample_pre_filter(
     #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] bloom_texture_mips: &RuntimeArray<
         Image!(2D, format=rgba32f, sampled=false),
     >,
-    #[spirv(descriptor_set = 1, binding = 1)] sampler: &Sampler,
     #[spirv(global_invocation_id)] id: IVec3,
+    #[spirv(push_constant)] filter_constants: &FilterConstants,
 ) {
     let id = id.truncate();
 
     let bloom_texture = unsafe { bloom_texture_mips.index(0) };
 
-    let output_size: UVec2 = bloom_texture.query_size();
-    let texel_size = Vec2::splat(1.0) / output_size.as_f32();
-    let uv = id.as_f32() * texel_size;
+    let (texel_size, uv) = calculate_texel_size_and_uv(&bloom_texture, id);
 
-    let sample = downsample_box_13_tap(hdr_texture, *sampler, uv, texel_size);
+    let sample = downsample_box_13_tap(hdr_texture, *sampler, uv, texel_size, 0);
+
+    let thresholded = quadratic_colour_thresholding(sample, filter_constants.threshold, filter_constants.knee);
 
     unsafe {
-        bloom_texture.write(id, sample);
+        bloom_texture.write(id, thresholded.extend(1.0));
     }
+}
+
+#[spirv(compute(threads(8, 8, 1)))]
+pub fn downsample(
+    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
+        Image!(2D, format=rgba32f, sampled=false),
+    >,
+    #[spirv(global_invocation_id)] id: IVec3,
+    #[spirv(push_constant)] source_mip: &u32,
+) {
+    let id = id.truncate();
+
+    let destination_texture = unsafe { destination_textures.index((*source_mip + 1) as usize) };
+
+    let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
+
+    let sample =
+        downsample_box_13_tap(source_texture, *sampler, uv, texel_size, *source_mip).extend(1.0);
+
+    unsafe {
+        destination_texture.write(id, sample);
+    }
+}
+
+#[spirv(compute(threads(8, 8, 1)))]
+pub fn upsample(
+    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
+        Image!(2D, format=rgba32f, sampled=false),
+    >,
+    #[spirv(global_invocation_id)] id: IVec3,
+    #[spirv(push_constant)] dest_mip: &u32,
+) {
+    let id = id.truncate();
+
+    let destination_texture = unsafe { destination_textures.index(*dest_mip as usize) };
+
+    let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
+
+    let sample =
+        sample_3x3_tent(source_texture, *sampler, uv, texel_size, *dest_mip + 1).extend(1.0);
+
+    let existing_sample: Vec4 = destination_texture.read(id);
+
+    unsafe {
+        destination_texture.write(id, existing_sample + sample);
+    }
+}
+
+#[spirv(compute(threads(8, 8, 1)))]
+pub fn upsample_final(
+    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(descriptor_set = 1, binding = 0)] hdr_texture: &Image!(2D, format=rgba32f, sampled=false),
+    #[spirv(global_invocation_id)] id: IVec3,
+) {
+    let id = id.truncate();
+
+    let (texel_size, uv) = calculate_texel_size_and_uv(&hdr_texture, id);
+
+    let sample = sample_3x3_tent(source_texture, *sampler, uv, texel_size, 0).extend(1.0);
+
+    let existing_sample: Vec4 = hdr_texture.read(id);
+
+    unsafe {
+        hdr_texture.write(id, existing_sample + sample);
+    }
+}
+
+fn sample_vec3_at_lod(
+    texture: &Image!(2D, type=f32, sampled),
+    sampler: Sampler,
+    uv: Vec2,
+    lod: u32,
+) -> Vec3 {
+    let sample: Vec4 = texture.sample_by_lod(sampler, uv, lod as f32);
+    sample.truncate()
 }
 
 // . . . . . . .
@@ -147,25 +244,27 @@ pub fn downsample_pre_filter(
 // . . I . J . .
 // . K . L . M .
 // . . . . . . .
+#[rustfmt::skip]
 fn downsample_box_13_tap(
     texture: &Image!(2D, type=f32, sampled),
     sampler: Sampler,
     uv: Vec2,
     texel_size: Vec2,
-) -> Vec4 {
-    let a: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-1.0, -1.0), 0.0);
-    let b: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.0, -1.0), 0.0);
-    let c: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(1.0, -1.0), 0.0);
-    let d: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-0.5, -0.5), 0.0);
-    let e: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.5, -0.5), 0.0);
-    let f: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-1.0, 0.0), 0.0);
-    let g: Vec4 = texture.sample_by_lod(sampler, uv, 0.0);
-    let h: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(1.0, 0.0), 0.0);
-    let i: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-0.5, 0.5), 0.0);
-    let j: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.5, 0.5), 0.0);
-    let k: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-1.0, 1.0), 0.0);
-    let l: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.0, 1.0), 0.0);
-    let m: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(1.0, 1.0), 0.0);
+    lod: u32,
+) -> Vec3 {
+    let a = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, -1.0), lod);
+    let b = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, -1.0),  lod);
+    let c = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, -1.0),  lod);
+    let d = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-0.5, -0.5), lod);
+    let e = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.5, -0.5),  lod);
+    let f = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 0.0),  lod);
+    let g = sample_vec3_at_lod(texture, sampler, uv, lod);
+    let h = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 0.0),  lod);
+    let i = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-0.5, 0.5), lod);
+    let j = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.5, 0.5),  lod);
+    let k = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 1.0), lod);
+    let l = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, 1.0),  lod);
+    let m = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 1.0),  lod);
 
     let center_pixels = d + e + i + j;
 
@@ -177,11 +276,38 @@ fn downsample_box_13_tap(
     center_pixels * 0.25 * 0.5 + (top_left + top_right + bottom_left + bottom_right) * 0.25 * 0.125
 }
 
+//        1 2 1
+// 1/16 * 2 4 2
+//        1 2 1
+#[rustfmt::skip]
+fn sample_3x3_tent(
+    texture: &Image!(2D, type = f32, sampled),
+    sampler: Sampler,
+    uv: Vec2,
+    texel_size: Vec2,
+    lod: u32
+) -> Vec3 {
+
+    let a = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, -1.0), lod);
+    let b = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, -1.0),  lod) * 2.0;
+    let c = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, -1.0),  lod);
+    let d = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 0.0),  lod) * 2.0;
+    let e = sample_vec3_at_lod(texture, sampler, uv, lod) * 4.0;
+    let f = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 0.0),  lod) * 2.0;
+    let g = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(-1.0, 1.0), lod);
+    let h = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(0.0, 1.0),  lod) * 2.0;
+    let i = sample_vec3_at_lod(texture, sampler, uv + texel_size * Vec2::new(1.0, 1.0),  lod);
+
+    (a + b + c + d + e + f + g + h + i) / 16.0
+}
+
 //
 // Quadratic color thresholding
 // curve = (threshold - knee, knee * 2, 0.25 / knee)
 //
-fn quadratic_threshold(mut color: Vec4, threshold: f32, curve: Vec3) -> Vec4 {
+fn quadratic_colour_thresholding(color: Vec3, threshold: f32, knee: f32) -> Vec3 {
+    let curve = Vec3::new(threshold - knee, knee * 2.0, 0.25 / knee);
+
     // Pixel brightness
     let brightness = color.max_element();
 
@@ -190,9 +316,7 @@ fn quadratic_threshold(mut color: Vec4, threshold: f32, curve: Vec3) -> Vec4 {
     rq = curve.z * rq * rq;
 
     // Combine and apply the brightness response curve.
-    color *= rq.max(brightness - threshold) / brightness.max(core::f32::EPSILON);
-
-    color
+    color * rq.max(brightness - threshold) / brightness.max(core::f32::EPSILON)
 }
 
 fn clamp(value: f32, min: f32, max: f32) -> f32 {
