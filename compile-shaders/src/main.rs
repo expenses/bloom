@@ -3,7 +3,7 @@ use spirv_builder::{Capability, MetadataPrintout, SpirvBuilder};
 fn main() -> anyhow::Result<()> {
     let extensions = &[];
 
-    let capabilities = &[];
+    let capabilities = &[Capability::ImageQuery];
 
     compile_shader_multi("shaders/rendering", extensions, capabilities)?;
 

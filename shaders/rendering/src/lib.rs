@@ -8,9 +8,9 @@
 // This needs to be here to provide `#[panic_handler]`.
 extern crate spirv_std;
 
-use spirv_std::glam::{Mat4, Vec2, Vec3, Vec4};
+use spirv_std::glam::{IVec2, IVec3, Mat4, UVec2, UVec3, Vec2, Vec3, Vec4};
 use spirv_std::num_traits::Float;
-use spirv_std::{Image, Sampler};
+use spirv_std::{Image, RuntimeArray, Sampler};
 
 #[spirv(vertex)]
 pub fn vertex(
@@ -108,4 +108,93 @@ pub struct BakedLottesTonemapperParams {
     crosstalk: f32,
     saturation: f32,
     cross_saturation: f32,
+}
+
+// https://github.com/bevyengine/bevy/blob/2c11ca0291f94b14ee32883d40f8243f3c8e3d6c/pipelined/bevy_hdr/src/bloom.wgsl
+
+// https://github.com/Unity-Technologies/Graphics/blob/master/com.unity.postprocessing/PostProcessing/Shaders/Builtins/Bloom.shader
+
+// http://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare
+
+#[spirv(compute(threads(8, 8, 1)))]
+pub fn downsample_pre_filter(
+    #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 1, binding = 0)] bloom_texture_mips: &RuntimeArray<
+        Image!(2D, format=rgba32f, sampled=false),
+    >,
+    #[spirv(descriptor_set = 1, binding = 1)] sampler: &Sampler,
+    #[spirv(global_invocation_id)] id: IVec3,
+) {
+    let id = id.truncate();
+
+    let bloom_texture = unsafe { bloom_texture_mips.index(0) };
+
+    let output_size: UVec2 = bloom_texture.query_size();
+    let texel_size = Vec2::splat(1.0) / output_size.as_f32();
+    let uv = id.as_f32() * texel_size;
+
+    let sample = downsample_box_13_tap(hdr_texture, *sampler, uv, texel_size);
+
+    unsafe {
+        bloom_texture.write(id, sample);
+    }
+}
+
+// . . . . . . .
+// . A . B . C .
+// . . D . E . .
+// . F . G . H .
+// . . I . J . .
+// . K . L . M .
+// . . . . . . .
+fn downsample_box_13_tap(
+    texture: &Image!(2D, type=f32, sampled),
+    sampler: Sampler,
+    uv: Vec2,
+    texel_size: Vec2,
+) -> Vec4 {
+    let a: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-1.0, -1.0), 0.0);
+    let b: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.0, -1.0), 0.0);
+    let c: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(1.0, -1.0), 0.0);
+    let d: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-0.5, -0.5), 0.0);
+    let e: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.5, -0.5), 0.0);
+    let f: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-1.0, 0.0), 0.0);
+    let g: Vec4 = texture.sample_by_lod(sampler, uv, 0.0);
+    let h: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(1.0, 0.0), 0.0);
+    let i: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-0.5, 0.5), 0.0);
+    let j: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.5, 0.5), 0.0);
+    let k: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(-1.0, 1.0), 0.0);
+    let l: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(0.0, 1.0), 0.0);
+    let m: Vec4 = texture.sample_by_lod(sampler, uv + texel_size * Vec2::new(1.0, 1.0), 0.0);
+
+    let center_pixels = d + e + i + j;
+
+    let top_left = a + b + f + g;
+    let top_right = b + c + g + h;
+    let bottom_left = f + g + k + l;
+    let bottom_right = g + h + l + m;
+
+    center_pixels * 0.25 * 0.5 + (top_left + top_right + bottom_left + bottom_right) * 0.25 * 0.125
+}
+
+//
+// Quadratic color thresholding
+// curve = (threshold - knee, knee * 2, 0.25 / knee)
+//
+fn quadratic_threshold(mut color: Vec4, threshold: f32, curve: Vec3) -> Vec4 {
+    // Pixel brightness
+    let brightness = color.max_element();
+
+    // Under-threshold part: quadratic curve
+    let mut rq = clamp(brightness - curve.x, 0.0, curve.y);
+    rq = curve.z * rq * rq;
+
+    // Combine and apply the brightness response curve.
+    color *= rq.max(brightness - threshold) / brightness.max(core::f32::EPSILON);
+
+    color
+}
+
+fn clamp(value: f32, min: f32, max: f32) -> f32 {
+    value.max(min).min(max)
 }

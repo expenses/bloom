@@ -26,9 +26,14 @@ fn main() -> anyhow::Result<()> {
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("device"),
-            features: wgpu::Features::PUSH_CONSTANTS,
+            features: wgpu::Features::PUSH_CONSTANTS
+                | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                | wgpu::Features::TEXTURE_BINDING_ARRAY
+                | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+                | wgpu::Features::SPIRV_SHADER_PASSTHROUGH,
             limits: wgpu::Limits {
                 max_push_constant_size: 128,
+                max_storage_textures_per_shader_stage: 16,
                 ..Default::default()
             },
         },
@@ -52,7 +57,7 @@ fn main() -> anyhow::Result<()> {
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2,
@@ -81,9 +86,12 @@ fn main() -> anyhow::Result<()> {
         }],
     });
 
-    let vertex_module = device.create_shader_module(&wgpu::include_spirv!("../shaders/vertex.spv"));
-    let fragment_module =
-        device.create_shader_module(&wgpu::include_spirv!("../shaders/fragment.spv"));
+    let vertex_module = unsafe {
+        device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/vertex.spv"))
+    };
+    let fragment_module = unsafe {
+        device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/fragment.spv"))
+    };
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("render pipeline"),
@@ -121,10 +129,13 @@ fn main() -> anyhow::Result<()> {
         multisample: wgpu::MultisampleState::default(),
     });
 
-    let fullscreen_tri_module =
-        device.create_shader_module(&wgpu::include_spirv!("../shaders/fullscreen_tri.spv"));
-    let tonemap_module =
-        device.create_shader_module(&wgpu::include_spirv!("../shaders/tonemap.spv"));
+    let fullscreen_tri_module = unsafe {
+        device
+            .create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/fullscreen_tri.spv"))
+    };
+    let tonemap_module = unsafe {
+        device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/tonemap.spv"))
+    };
 
     let tonemap_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("tonemap pipeline layout"),
@@ -158,6 +169,53 @@ fn main() -> anyhow::Result<()> {
         }),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
+    });
+
+    let max_mips = 16;
+
+    let bloom_texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bloom texture bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::ReadWrite,
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: Some(core::num::NonZeroU32::new(max_mips).unwrap()),
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler {
+                    filtering: true,
+                    comparison: false,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let pre_filter_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pre filter pipeline layout"),
+            bind_group_layouts: &[&bind_group_layout, &bloom_texture_bgl],
+            push_constant_ranges: &[],
+        });
+
+    let pre_filter_module = unsafe {
+        device.create_shader_module_spirv(&wgpu::include_spirv_raw!(
+            "../shaders/downsample_pre_filter.spv"
+        ))
+    };
+
+    let pre_filter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("pre filter pipeline"),
+        layout: Some(&pre_filter_pipeline_layout),
+        module: &pre_filter_module,
+        entry_point: "downsample_pre_filter",
     });
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -212,13 +270,36 @@ fn main() -> anyhow::Result<()> {
 
     let mut hdr_framebuffer_view = create_hdr_framebuffer(&device, &surface_configuration);
 
-    let mut tonemap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tonemap bind group"),
+    let mut hdr_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hdr texture bind group"),
         layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    let mut bloom_mips =
+        bloom_mips_for_dimensions(surface_configuration.width, surface_configuration.height);
+
+    let mut bloom_texture_mip_chain =
+        MipChain::new(&device, &surface_configuration, bloom_mips, max_mips);
+
+    let mut bloom_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bloom texture bind group"),
+        layout: &bloom_texture_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureViewArray(
+                    &bloom_texture_mip_chain.bindings(),
+                ),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -250,8 +331,8 @@ fn main() -> anyhow::Result<()> {
 
                 hdr_framebuffer_view = create_hdr_framebuffer(&device, &surface_configuration);
 
-                tonemap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("tonemap bind group"),
+                hdr_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("hdr texture bind group"),
                     layout: &bind_group_layout,
                     entries: &[
                         wgpu::BindGroupEntry {
@@ -263,7 +344,32 @@ fn main() -> anyhow::Result<()> {
                             resource: wgpu::BindingResource::Sampler(&sampler),
                         },
                     ],
-                })
+                });
+
+                bloom_mips = bloom_mips_for_dimensions(
+                    surface_configuration.width,
+                    surface_configuration.height,
+                );
+
+                bloom_texture_mip_chain =
+                    MipChain::new(&device, &surface_configuration, bloom_mips, max_mips);
+
+                bloom_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("bloom texture bind group"),
+                    layout: &bloom_texture_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureViewArray(
+                                &bloom_texture_mip_chain.bindings(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                });
             }
             WindowEvent::KeyboardInput {
                 input:
@@ -406,7 +512,7 @@ fn main() -> anyhow::Result<()> {
             });
 
             render_pass.set_pipeline(&tonemap_pipeline);
-            render_pass.set_bind_group(0, &tonemap_bind_group, &[]);
+            render_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
             render_pass.set_push_constants(
                 wgpu::ShaderStages::FRAGMENT,
                 0,
@@ -417,6 +523,22 @@ fn main() -> anyhow::Result<()> {
             render_pass.draw(0..3, 0..1);
 
             drop(render_pass);
+
+            let mut compute_pass =
+                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("compute pass"),
+                });
+
+            compute_pass.set_pipeline(&pre_filter_pipeline);
+            compute_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
+            compute_pass.set_bind_group(1, &bloom_texture_bind_group, &[]);
+            compute_pass.dispatch(
+                dispatch_count(bloom_texture_mip_chain.width, 8),
+                dispatch_count(bloom_texture_mip_chain.height, 8),
+                1,
+            );
+
+            drop(compute_pass);
 
             queue.submit(std::iter::once(command_encoder.finish()));
 
@@ -466,6 +588,59 @@ fn create_hdr_framebuffer(
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         })
         .create_view(&Default::default())
+}
+
+struct MipChain {
+    views: Vec<wgpu::TextureView>,
+    width: u32,
+    height: u32,
+}
+
+impl MipChain {
+    fn new(
+        device: &wgpu::Device,
+        surface_configuration: &wgpu::SurfaceConfiguration,
+        mip_levels: u32,
+        max_mips: u32,
+    ) -> Self {
+        let width = (surface_configuration.width / 2).max(1);
+        let height = (surface_configuration.height / 2).max(1);
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bloom texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING,
+        });
+
+        let dummy_mips = std::iter::repeat(mip_levels - 1).take((max_mips - mip_levels) as usize);
+
+        Self {
+            views: (0..mip_levels)
+                .chain(dummy_mips)
+                .map(|i| {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        base_mip_level: i,
+                        mip_level_count: Some(core::num::NonZeroU32::new(1).unwrap()),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+            width,
+            height,
+        }
+    }
+
+    fn bindings(&self) -> Vec<&wgpu::TextureView> {
+        self.views.iter().collect()
+    }
 }
 
 #[derive(Default)]
@@ -590,4 +765,26 @@ fn load_texture_from_gltf(
             &*decoded_rgba8,
         )
         .create_view(&Default::default()))
+}
+
+// https://github.com/bevyengine/bevy/blob/2c11ca0291f94b14ee32883d40f8243f3c8e3d6c/pipelined/bevy_hdr/src/bloom_node.rs#L292-L297
+fn bloom_mips_for_dimensions(width: u32, height: u32) -> u32 {
+    let min_element = width.min(height) / 2;
+    let mut mips = 1;
+
+    while min_element / 2u32.pow(mips) > 4 {
+        mips += 1;
+    }
+
+    mips
+}
+
+const fn dispatch_count(num: u32, group_size: u32) -> u32 {
+    let mut count = num / group_size;
+    let rem = num % group_size;
+    if rem != 0 {
+        count += 1;
+    }
+
+    count
 }
