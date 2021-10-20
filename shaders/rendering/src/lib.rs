@@ -8,7 +8,7 @@
 // This needs to be here to provide `#[panic_handler]`.
 extern crate spirv_std;
 
-use spirv_std::glam::{IVec2, IVec3, Mat4, UVec2, Vec2, Vec3, Vec4};
+use spirv_std::glam::{IVec2, Mat4, UVec2, Vec2, Vec3, Vec4};
 use spirv_std::num_traits::Float;
 use spirv_std::{Image, RuntimeArray, Sampler};
 
@@ -151,18 +151,16 @@ pub struct FilterConstants {
     knee: f32,
 }
 
-#[spirv(compute(threads(8, 8, 1)))]
+#[spirv(compute(threads(8, 8)))]
 pub fn downsample_initial(
     #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] bloom_texture_mips: &RuntimeArray<
         Image!(2D, format=rgba32f, sampled=false),
     >,
-    #[spirv(global_invocation_id)] id: IVec3,
+    #[spirv(global_invocation_id)] id: IVec2,
     #[spirv(push_constant)] filter_constants: &FilterConstants,
 ) {
-    let id = id.truncate();
-
     let bloom_texture = unsafe { bloom_texture_mips.index(0) };
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&bloom_texture, id);
@@ -177,18 +175,16 @@ pub fn downsample_initial(
     }
 }
 
-#[spirv(compute(threads(8, 8, 1)))]
+#[spirv(compute(threads(8, 8)))]
 pub fn downsample(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
         Image!(2D, format=rgba32f, sampled=false),
     >,
-    #[spirv(global_invocation_id)] id: IVec3,
+    #[spirv(global_invocation_id)] id: IVec2,
     #[spirv(push_constant)] source_mip: &u32,
 ) {
-    let id = id.truncate();
-
     let destination_texture = unsafe { destination_textures.index((*source_mip + 1) as usize) };
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
@@ -201,18 +197,16 @@ pub fn downsample(
     }
 }
 
-#[spirv(compute(threads(8, 8, 1)))]
+#[spirv(compute(threads(8, 8)))]
 pub fn upsample(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
         Image!(2D, format=rgba32f, sampled=false),
     >,
-    #[spirv(global_invocation_id)] id: IVec3,
+    #[spirv(global_invocation_id)] id: IVec2,
     #[spirv(push_constant)] dest_mip: &u32,
 ) {
-    let id = id.truncate();
-
     let destination_texture = unsafe { destination_textures.index(*dest_mip as usize) };
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
@@ -227,15 +221,13 @@ pub fn upsample(
     }
 }
 
-#[spirv(compute(threads(8, 8, 1)))]
+#[spirv(compute(threads(8, 8)))]
 pub fn upsample_final(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] hdr_texture: &Image!(2D, format=rgba32f, sampled=false),
-    #[spirv(global_invocation_id)] id: IVec3,
+    #[spirv(global_invocation_id)] id: IVec2,
 ) {
-    let id = id.truncate();
-
     let (texel_size, uv) = calculate_texel_size_and_uv(&hdr_texture, id);
 
     let sample = sample_3x3_tent(source_texture, *sampler, uv, texel_size, 0).extend(1.0);

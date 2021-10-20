@@ -574,6 +574,8 @@ fn compute_bloom<'a>(
     compute_pass.set_bind_group(0, input_sampled_texture_bind_group, &[]);
     compute_pass.set_bind_group(1, &bloom_texture_a.storage_mips_bind_group, &[]);
     compute_pass.set_push_constants(0, bytemuck::bytes_of(filter_constants));
+    // Note that the 0th mip of the bloom textures is half the size of the framebuffer texture
+    // so we need to shift the dimensions right by one.
     compute_pass.dispatch(
         dispatch_count(width >> 1, 8),
         dispatch_count(height >> 1, 8),
