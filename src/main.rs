@@ -222,7 +222,7 @@ fn main() -> anyhow::Result<()> {
         }],
     });
 
-    let mut bloom_mips =
+    let bloom_mips =
         bloom_mips_for_dimensions(surface_configuration.width, surface_configuration.height);
 
     let mut bloom_texture_a = BloomTextureWithMips::new(
@@ -308,7 +308,7 @@ fn main() -> anyhow::Result<()> {
                             }],
                         });
 
-                    bloom_mips = bloom_mips_for_dimensions(
+                    let bloom_mips = bloom_mips_for_dimensions(
                         surface_configuration.width,
                         surface_configuration.height,
                     );
@@ -465,68 +465,16 @@ fn main() -> anyhow::Result<()> {
                         label: Some("compute pass"),
                     });
 
-                compute_pass.set_pipeline(&compute_pipelines.downsample_initial);
-                compute_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
-                compute_pass.set_bind_group(1, &bloom_texture_a.storage_mips_bind_group, &[]);
-                compute_pass.set_push_constants(0, bytemuck::bytes_of(&filter_constants));
-                compute_pass.dispatch(
-                    dispatch_count(surface_configuration.width >> 1, 8),
-                    dispatch_count(surface_configuration.height >> 1, 8),
-                    1,
-                );
-
-                compute_pass.set_pipeline(&compute_pipelines.downsample);
-
-                // We have to ping-pong between textures because webgpu doesn't allow
-                // having the same texture bound as both a storage texture and sampled texture.
-                //
-                // This is pretty wasteful as we only use half the mips of each texture.
-
-                for i in 0..bloom_mips - 1 {
-                    let mut src = &bloom_texture_a;
-                    let mut dst = &bloom_texture_b;
-
-                    if i % 2 == 1 {
-                        std::mem::swap(&mut src, &mut dst);
-                    }
-
-                    compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
-                    compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
-                    compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
-                    compute_pass.dispatch(
-                        dispatch_count(surface_configuration.width >> (i + 2), 8),
-                        dispatch_count(surface_configuration.height >> (i + 2), 8),
-                        1,
-                    );
-                }
-
-                compute_pass.set_pipeline(&compute_pipelines.upsample);
-
-                for i in (0..bloom_mips - 1).rev() {
-                    let mut src = &bloom_texture_a;
-                    let mut dst = &bloom_texture_b;
-
-                    if i % 2 == 0 {
-                        std::mem::swap(&mut src, &mut dst);
-                    }
-
-                    compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
-                    compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
-                    compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
-                    compute_pass.dispatch(
-                        dispatch_count(surface_configuration.width >> (i + 1), 8),
-                        dispatch_count(surface_configuration.height >> (i + 1), 8),
-                        1,
-                    );
-                }
-
-                compute_pass.set_pipeline(&compute_pipelines.upsample_final);
-                compute_pass.set_bind_group(0, &bloom_texture_a.sampled_texture_bind_group, &[]);
-                compute_pass.set_bind_group(1, &hdr_texture_storage_bind_group, &[]);
-                compute_pass.dispatch(
-                    dispatch_count(surface_configuration.width, 8),
-                    dispatch_count(surface_configuration.height, 8),
-                    1,
+                compute_bloom(
+                    &mut compute_pass,
+                    &hdr_texture_bind_group,
+                    &hdr_texture_storage_bind_group,
+                    &bloom_texture_a,
+                    &bloom_texture_b,
+                    &compute_pipelines,
+                    surface_configuration.width,
+                    surface_configuration.height,
+                    &filter_constants,
                 );
 
                 drop(compute_pass);
@@ -609,6 +557,81 @@ fn main() -> anyhow::Result<()> {
             _ => {}
         }
     });
+}
+
+fn compute_bloom<'a>(
+    compute_pass: &mut wgpu::ComputePass<'a>,
+    input_sampled_texture_bind_group: &'a wgpu::BindGroup,
+    output_storage_texture_bind_group: &'a wgpu::BindGroup,
+    bloom_texture_a: &'a BloomTextureWithMips,
+    bloom_texture_b: &'a BloomTextureWithMips,
+    pipelines: &'a ComputePipelines,
+    width: u32,
+    height: u32,
+    filter_constants: &FilterConstants,
+) {
+    compute_pass.set_pipeline(&pipelines.downsample_initial);
+    compute_pass.set_bind_group(0, input_sampled_texture_bind_group, &[]);
+    compute_pass.set_bind_group(1, &bloom_texture_a.storage_mips_bind_group, &[]);
+    compute_pass.set_push_constants(0, bytemuck::bytes_of(filter_constants));
+    compute_pass.dispatch(
+        dispatch_count(width >> 1, 8),
+        dispatch_count(height >> 1, 8),
+        1,
+    );
+
+    compute_pass.set_pipeline(&pipelines.downsample);
+
+    // We recreate the bloom textures when we resize, so this will always equal the number of mips in each texture.
+    let bloom_mips = bloom_mips_for_dimensions(width, height);
+
+    // We have to ping-pong between textures because webgpu doesn't allow
+    // having the same texture bound as both a storage texture and sampled texture.
+    //
+    // This is pretty wasteful as we only use half the mips of each texture.
+
+    for i in 0..bloom_mips - 1 {
+        let mut src = &bloom_texture_a;
+        let mut dst = &bloom_texture_b;
+
+        if i % 2 == 1 {
+            std::mem::swap(&mut src, &mut dst);
+        }
+
+        compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
+        compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
+        compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
+        compute_pass.dispatch(
+            dispatch_count(width >> (i + 2), 8),
+            dispatch_count(height >> (i + 2), 8),
+            1,
+        );
+    }
+
+    compute_pass.set_pipeline(&pipelines.upsample);
+
+    for i in (0..bloom_mips - 1).rev() {
+        let mut src = &bloom_texture_a;
+        let mut dst = &bloom_texture_b;
+
+        if i % 2 == 0 {
+            std::mem::swap(&mut src, &mut dst);
+        }
+
+        compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
+        compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
+        compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
+        compute_pass.dispatch(
+            dispatch_count(width >> (i + 1), 8),
+            dispatch_count(height >> (i + 1), 8),
+            1,
+        );
+    }
+
+    compute_pass.set_pipeline(&pipelines.upsample_final);
+    compute_pass.set_bind_group(0, &bloom_texture_a.sampled_texture_bind_group, &[]);
+    compute_pass.set_bind_group(1, output_storage_texture_bind_group, &[]);
+    compute_pass.dispatch(dispatch_count(width, 8), dispatch_count(height, 8), 1);
 }
 
 struct BindGroupLayouts {
