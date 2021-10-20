@@ -224,7 +224,7 @@ pub fn upsample(
     }
 }
 
-// Sample the bloom texture for a final time at the 0th mip and perform hdr blending with the hdr texture.
+// Sample the bloom texture for a final time at the 0th mip and perform additive blending with the hdr texture.
 #[spirv(compute(threads(8, 8)))]
 pub fn upsample_final(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
