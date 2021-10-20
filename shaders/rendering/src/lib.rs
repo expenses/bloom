@@ -151,6 +151,7 @@ pub struct FilterConstants {
     knee: f32,
 }
 
+// Sample and filter the input HDR texture into the 0th half-size mip of the bloom texture.
 #[spirv(compute(threads(8, 8)))]
 pub fn downsample_initial(
     #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &Image!(2D, type=f32, sampled),
@@ -175,6 +176,7 @@ pub fn downsample_initial(
     }
 }
 
+// Sample the bloom texture at mip N and write to mip N + 1.
 #[spirv(compute(threads(8, 8)))]
 pub fn downsample(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
@@ -197,6 +199,7 @@ pub fn downsample(
     }
 }
 
+// Sample the bloom texture at mip N + 1, perform additive blending with the texture at mip N and write to mip N.
 #[spirv(compute(threads(8, 8)))]
 pub fn upsample(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
@@ -221,6 +224,7 @@ pub fn upsample(
     }
 }
 
+// Sample the bloom texture for a final time at the 0th mip and perform hdr blending with the hdr texture.
 #[spirv(compute(threads(8, 8)))]
 pub fn upsample_final(
     #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
