@@ -150,7 +150,8 @@ pub fn downsample_pre_filter(
 
     let sample = downsample_box_13_tap(hdr_texture, *sampler, uv, texel_size, 0);
 
-    let thresholded = quadratic_colour_thresholding(sample, filter_constants.threshold, filter_constants.knee);
+    let thresholded =
+        quadratic_colour_thresholding(sample, filter_constants.threshold, filter_constants.knee);
 
     unsafe {
         bloom_texture.write(id, thresholded.extend(1.0));

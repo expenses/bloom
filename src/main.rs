@@ -4,6 +4,9 @@ use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEve
 use winit::event_loop::ControlFlow;
 use winit::window::Fullscreen;
 
+// I get 10 mip levels on a 2560 x 1600 display, so 12 is probably enough even for 4k.
+const MAX_MIPS: u32 = 12;
+
 fn main() -> anyhow::Result<()> {
     let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
 
@@ -33,7 +36,7 @@ fn main() -> anyhow::Result<()> {
                 | wgpu::Features::SPIRV_SHADER_PASSTHROUGH,
             limits: wgpu::Limits {
                 max_push_constant_size: 128,
-                max_storage_textures_per_shader_stage: 16,
+                max_storage_textures_per_shader_stage: MAX_MIPS,
                 ..Default::default()
             },
         },
@@ -162,8 +165,6 @@ fn main() -> anyhow::Result<()> {
         multisample: wgpu::MultisampleState::default(),
     });
 
-    let max_mips = 16;
-
     let bloom_texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bloom texture bgl"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -174,7 +175,7 @@ fn main() -> anyhow::Result<()> {
                 format: wgpu::TextureFormat::Rgba32Float,
                 view_dimension: wgpu::TextureViewDimension::D2,
             },
-            count: Some(core::num::NonZeroU32::new(max_mips).unwrap()),
+            count: Some(core::num::NonZeroU32::new(MAX_MIPS).unwrap()),
         }],
     });
 
@@ -340,7 +341,6 @@ fn main() -> anyhow::Result<()> {
         &device,
         &surface_configuration,
         bloom_mips,
-        max_mips,
         &bloom_texture_bgl,
         &bind_group_layout,
         &sampler,
@@ -350,314 +350,375 @@ fn main() -> anyhow::Result<()> {
         &device,
         &surface_configuration,
         bloom_mips,
-        max_mips,
         &bloom_texture_bgl,
         &bind_group_layout,
         &sampler,
     );
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent { event, .. } => match event {
-            WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-            WindowEvent::Resized(new_size) => {
-                surface_configuration.width = new_size.width;
-                surface_configuration.height = new_size.height;
-                surface.configure(&device, &surface_configuration);
+    let mut egui_platform =
+        egui_winit_platform::Platform::new(egui_winit_platform::PlatformDescriptor {
+            physical_width: surface_configuration.width,
+            physical_height: surface_configuration.height,
+            scale_factor: window.scale_factor(),
+            font_definitions: Default::default(),
+            style: Default::default(),
+        });
 
-                screen_center = winit::dpi::LogicalPosition::new(
-                    surface_configuration.width as f64 / 2.0,
-                    surface_configuration.height as f64 / 2.0,
-                );
+    let mut egui_render_pass = egui_wgpu_backend::RenderPass::new(&device, surface_format, 1);
 
-                perspective_matrix = ultraviolet::projection::perspective_infinite_z_wgpu_dx(
-                    59.0_f32.to_radians(),
-                    surface_configuration.width as f32 / surface_configuration.height as f32,
-                    0.1,
-                );
+    let mut filter_constants = FilterConstants {
+        threshold: 7.0,
+        knee: 7.0,
+    };
 
-                depth_buffer_view = create_depth_buffer(&device, &surface_configuration);
+    event_loop.run(move |event, _, control_flow| {
+        egui_platform.handle_event(&event);
 
-                hdr_framebuffer_view = create_hdr_framebuffer(&device, &surface_configuration);
+        match event {
+            Event::WindowEvent { event, .. } => match event {
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                WindowEvent::Resized(new_size) => {
+                    surface_configuration.width = new_size.width;
+                    surface_configuration.height = new_size.height;
+                    surface.configure(&device, &surface_configuration);
 
-                hdr_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("hdr texture bind group"),
-                    layout: &bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&sampler),
-                        },
-                    ],
-                });
+                    screen_center = winit::dpi::LogicalPosition::new(
+                        surface_configuration.width as f64 / 2.0,
+                        surface_configuration.height as f64 / 2.0,
+                    );
 
-                hdr_texture_storage_bind_group =
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("hdr texture storage bind group"),
-                        layout: &single_storage_texture_bgl,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
-                        }],
+                    perspective_matrix = ultraviolet::projection::perspective_infinite_z_wgpu_dx(
+                        59.0_f32.to_radians(),
+                        surface_configuration.width as f32 / surface_configuration.height as f32,
+                        0.1,
+                    );
+
+                    depth_buffer_view = create_depth_buffer(&device, &surface_configuration);
+
+                    hdr_framebuffer_view = create_hdr_framebuffer(&device, &surface_configuration);
+
+                    hdr_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("hdr texture bind group"),
+                        layout: &bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&sampler),
+                            },
+                        ],
                     });
 
-                bloom_mips = bloom_mips_for_dimensions(
-                    surface_configuration.width,
-                    surface_configuration.height,
-                );
+                    hdr_texture_storage_bind_group =
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("hdr texture storage bind group"),
+                            layout: &single_storage_texture_bgl,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&hdr_framebuffer_view),
+                            }],
+                        });
 
-                mip_chain_a = MipChain::new(
-                    &device,
-                    &surface_configuration,
-                    bloom_mips,
-                    max_mips,
-                    &bloom_texture_bgl,
-                    &bind_group_layout,
-                    &sampler,
-                );
+                    bloom_mips = bloom_mips_for_dimensions(
+                        surface_configuration.width,
+                        surface_configuration.height,
+                    );
 
-                mip_chain_b = MipChain::new(
-                    &device,
-                    &surface_configuration,
-                    bloom_mips,
-                    max_mips,
-                    &bloom_texture_bgl,
-                    &bind_group_layout,
-                    &sampler,
-                );
-            }
-            WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        state,
-                        virtual_keycode: Some(key),
-                        ..
-                    },
-                ..
-            } => {
-                let is_pressed = state == ElementState::Pressed;
+                    mip_chain_a = MipChain::new(
+                        &device,
+                        &surface_configuration,
+                        bloom_mips,
+                        &bloom_texture_bgl,
+                        &bind_group_layout,
+                        &sampler,
+                    );
 
-                match key {
-                    VirtualKeyCode::W => keyboard_state.forwards = is_pressed,
-                    VirtualKeyCode::S => keyboard_state.backwards = is_pressed,
-                    VirtualKeyCode::A => keyboard_state.left = is_pressed,
-                    VirtualKeyCode::D => keyboard_state.right = is_pressed,
-                    VirtualKeyCode::F11 => {
-                        if is_pressed {
-                            if window.fullscreen().is_some() {
-                                window.set_fullscreen(None);
-                            } else {
-                                window.set_fullscreen(Some(Fullscreen::Borderless(None)))
+                    mip_chain_b = MipChain::new(
+                        &device,
+                        &surface_configuration,
+                        bloom_mips,
+                        &bloom_texture_bgl,
+                        &bind_group_layout,
+                        &sampler,
+                    );
+                }
+                WindowEvent::KeyboardInput {
+                    input:
+                        KeyboardInput {
+                            state,
+                            virtual_keycode: Some(key),
+                            ..
+                        },
+                    ..
+                } => {
+                    let is_pressed = state == ElementState::Pressed;
+
+                    match key {
+                        VirtualKeyCode::W => keyboard_state.forwards = is_pressed,
+                        VirtualKeyCode::S => keyboard_state.backwards = is_pressed,
+                        VirtualKeyCode::A => keyboard_state.left = is_pressed,
+                        VirtualKeyCode::D => keyboard_state.right = is_pressed,
+                        VirtualKeyCode::F11 => {
+                            if is_pressed {
+                                if window.fullscreen().is_some() {
+                                    window.set_fullscreen(None);
+                                } else {
+                                    window.set_fullscreen(Some(Fullscreen::Borderless(None)))
+                                }
                             }
                         }
-                    }
-                    VirtualKeyCode::G => {
-                        if is_pressed {
-                            cursor_grab = !cursor_grab;
+                        VirtualKeyCode::G => {
+                            if is_pressed {
+                                cursor_grab = !cursor_grab;
 
-                            if cursor_grab {
-                                window.set_cursor_position(screen_center).unwrap();
+                                if cursor_grab {
+                                    window.set_cursor_position(screen_center).unwrap();
+                                }
+
+                                window.set_cursor_visible(!cursor_grab);
+                                window.set_cursor_grab(cursor_grab).unwrap();
                             }
-
-                            window.set_cursor_visible(!cursor_grab);
-                            window.set_cursor_grab(cursor_grab).unwrap();
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                WindowEvent::CursorMoved { position, .. } => {
+                    if cursor_grab {
+                        let position = position.to_logical::<f64>(window.scale_factor());
+
+                        window.set_cursor_position(screen_center).unwrap();
+
+                        camera
+                            .driver_mut::<dolly::drivers::YawPitch>()
+                            .rotate_yaw_pitch(
+                                0.1 * (screen_center.x - position.x) as f32,
+                                0.1 * (screen_center.y - position.y) as f32,
+                            );
+                    }
+                }
+                _ => {}
+            },
+            Event::MainEventsCleared => {
+                let delta_time = 1.0 / 60.0;
+
+                let forwards = keyboard_state.forwards as i32 - keyboard_state.backwards as i32;
+                let right = keyboard_state.right as i32 - keyboard_state.left as i32;
+
+                let move_vec = camera.final_transform.rotation
+                    * dolly::glam::Vec3::new(right as f32, 0.0, -forwards as f32)
+                        .clamp_length_max(1.0);
+
+                camera
+                    .driver_mut::<dolly::drivers::Position>()
+                    .translate(move_vec * delta_time * 10.0);
+
+                camera.update(delta_time);
+
+                egui_platform.update_time(delta_time as f64);
+
+                window.request_redraw();
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                if cursor_grab {
-                    let position = position.to_logical::<f64>(window.scale_factor());
+            Event::RedrawRequested(_) => {
+                let texture = surface.get_current_texture().unwrap();
 
-                    window.set_cursor_position(screen_center).unwrap();
+                let camera_view = Mat4::look_at(
+                    Vec3::from(<[f32; 3]>::from(camera.final_transform.position)),
+                    Vec3::from(<[f32; 3]>::from(
+                        camera.final_transform.position + camera.final_transform.forward(),
+                    )),
+                    Vec3::from(<[f32; 3]>::from(camera.final_transform.up())),
+                );
 
-                    camera
-                        .driver_mut::<dolly::drivers::YawPitch>()
-                        .rotate_yaw_pitch(
-                            0.1 * (screen_center.x - position.x) as f32,
-                            0.1 * (screen_center.y - position.y) as f32,
-                        );
+                let texture_view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("surface texture view"),
+                    ..Default::default()
+                });
+
+                let mut command_encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("command encoder"),
+                    });
+
+                let mut render_pass =
+                    command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("render pass"),
+                        color_attachments: &[wgpu::RenderPassColorAttachment {
+                            view: &hdr_framebuffer_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: true,
+                            },
+                        }],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_buffer_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: true,
+                            }),
+                            stencil_ops: None,
+                        }),
+                    });
+
+                render_pass.set_pipeline(&render_pipeline);
+                render_pass.set_bind_group(0, &bind_group, &[]);
+                render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.set_vertex_buffer(0, vertices.slice(..));
+                render_pass.set_push_constants(
+                    wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&(perspective_matrix * camera_view)),
+                );
+                render_pass.draw_indexed(0..num_indices, 0, 0..1);
+
+                drop(render_pass);
+
+                let mut compute_pass =
+                    command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("compute pass"),
+                    });
+
+                compute_pass.set_pipeline(&pre_filter_pipeline);
+                compute_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
+                compute_pass.set_bind_group(1, &mip_chain_a.storage_mips_bind_group, &[]);
+                compute_pass.set_push_constants(0, bytemuck::bytes_of(&filter_constants));
+                compute_pass.dispatch(
+                    dispatch_count(surface_configuration.width >> 1, 8),
+                    dispatch_count(surface_configuration.height >> 1, 8),
+                    1,
+                );
+
+                compute_pass.set_pipeline(&downsample_pipeline);
+
+                for i in 0..bloom_mips - 1 {
+                    let mut src = &mip_chain_a;
+                    let mut dst = &mip_chain_b;
+
+                    if i % 2 == 1 {
+                        std::mem::swap(&mut src, &mut dst);
+                    }
+
+                    compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
+                    compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
+                    compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
+                    compute_pass.dispatch(
+                        dispatch_count(surface_configuration.width >> (i + 2), 8),
+                        dispatch_count(surface_configuration.height >> (i + 2), 8),
+                        1,
+                    );
                 }
+
+                compute_pass.set_pipeline(&upsample_pipeline);
+
+                for i in (0..bloom_mips - 1).rev() {
+                    let mut src = &mip_chain_a;
+                    let mut dst = &mip_chain_b;
+
+                    if i % 2 == 0 {
+                        std::mem::swap(&mut src, &mut dst);
+                    }
+
+                    compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
+                    compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
+                    compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
+                    compute_pass.dispatch(
+                        dispatch_count(surface_configuration.width >> (i + 1), 8),
+                        dispatch_count(surface_configuration.height >> (i + 1), 8),
+                        1,
+                    );
+                }
+
+                compute_pass.set_pipeline(&upsample_final_pipeline);
+                compute_pass.set_bind_group(0, &mip_chain_a.sampled_texture_bind_group, &[]);
+                compute_pass.set_bind_group(1, &hdr_texture_storage_bind_group, &[]);
+                compute_pass.dispatch(
+                    dispatch_count(surface_configuration.width, 8),
+                    dispatch_count(surface_configuration.height, 8),
+                    1,
+                );
+
+                drop(compute_pass);
+
+                let mut render_pass =
+                    command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("tonemap render pass"),
+                        color_attachments: &[wgpu::RenderPassColorAttachment {
+                            view: &texture_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: true,
+                            },
+                        }],
+                        depth_stencil_attachment: None,
+                    });
+
+                render_pass.set_pipeline(&tonemap_pipeline);
+                render_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
+                render_pass.set_push_constants(
+                    wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&colstodian::tonemap::BakedLottesTonemapperParams::from(
+                        colstodian::tonemap::LottesTonemapperParams {
+                            ..Default::default()
+                        },
+                    )),
+                );
+                render_pass.draw(0..3, 0..1);
+
+                drop(render_pass);
+
+                // gui
+
+                egui_platform.begin_frame();
+
+                egui::containers::Window::new("Controls").show(&egui_platform.context(), |ui| {
+                    ui.add(
+                        egui::widgets::Slider::new(&mut filter_constants.threshold, 0.0..=10.0)
+                            .text("Threshold"),
+                    );
+
+                    ui.add(
+                        egui::widgets::Slider::new(&mut filter_constants.knee, 0.0..=10.0)
+                            .text("Knee"),
+                    )
+                });
+
+                let (_output, paint_commands) = egui_platform.end_frame(Some(&window));
+                let paint_jobs = egui_platform.context().tessellate(paint_commands);
+
+                let screen_descriptor = egui_wgpu_backend::ScreenDescriptor {
+                    physical_width: surface_configuration.width,
+                    physical_height: surface_configuration.height,
+                    scale_factor: window.scale_factor() as f32,
+                };
+                egui_render_pass.update_texture(
+                    &device,
+                    &queue,
+                    &egui_platform.context().texture(),
+                );
+                egui_render_pass.update_user_textures(&device, &queue);
+                egui_render_pass.update_buffers(&device, &queue, &paint_jobs, &screen_descriptor);
+
+                egui_render_pass
+                    .execute(
+                        &mut command_encoder,
+                        &texture_view,
+                        &paint_jobs,
+                        &screen_descriptor,
+                        None,
+                    )
+                    .unwrap();
+
+                queue.submit(std::iter::once(command_encoder.finish()));
+
+                texture.present();
             }
             _ => {}
-        },
-        Event::MainEventsCleared => {
-            let delta_time = 1.0 / 60.0;
-
-            let forwards = keyboard_state.forwards as i32 - keyboard_state.backwards as i32;
-            let right = keyboard_state.right as i32 - keyboard_state.left as i32;
-
-            let move_vec = camera.final_transform.rotation
-                * dolly::glam::Vec3::new(right as f32, 0.0, -forwards as f32).clamp_length_max(1.0);
-
-            camera
-                .driver_mut::<dolly::drivers::Position>()
-                .translate(move_vec * delta_time * 10.0);
-
-            camera.update(delta_time);
-
-            window.request_redraw();
         }
-        Event::RedrawRequested(_) => {
-            let texture = surface.get_current_texture().unwrap();
-
-            let camera_view = Mat4::look_at(
-                Vec3::from(<[f32; 3]>::from(camera.final_transform.position)),
-                Vec3::from(<[f32; 3]>::from(
-                    camera.final_transform.position + camera.final_transform.forward(),
-                )),
-                Vec3::from(<[f32; 3]>::from(camera.final_transform.up())),
-            );
-
-            let texture_view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("surface texture view"),
-                ..Default::default()
-            });
-
-            let mut command_encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("command encoder"),
-                });
-
-            let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &hdr_framebuffer_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
-                    },
-                }],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_buffer_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: true,
-                    }),
-                    stencil_ops: None,
-                }),
-            });
-
-            render_pass.set_pipeline(&render_pipeline);
-            render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.set_vertex_buffer(0, vertices.slice(..));
-            render_pass.set_push_constants(
-                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&(perspective_matrix * camera_view)),
-            );
-            render_pass.draw_indexed(0..num_indices, 0, 0..1);
-
-            drop(render_pass);
-
-            let mut compute_pass =
-                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("compute pass"),
-                });
-
-            compute_pass.set_pipeline(&pre_filter_pipeline);
-            compute_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
-            compute_pass.set_bind_group(1, &mip_chain_a.storage_mips_bind_group, &[]);
-            compute_pass.set_push_constants(0, bytemuck::bytes_of(&FilterConstants {
-                threshold: 7.5,
-                knee: 5.0,
-            }));
-            compute_pass.dispatch(
-                dispatch_count(surface_configuration.width >> 1, 8),
-                dispatch_count(surface_configuration.height >> 1, 8),
-                1,
-            );
-
-            compute_pass.set_pipeline(&downsample_pipeline);
-
-            for i in 0..bloom_mips - 1 {
-                let mut src = &mip_chain_a;
-                let mut dst = &mip_chain_b;
-
-                if i % 2 == 1 {
-                    std::mem::swap(&mut src, &mut dst);
-                }
-
-                compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
-                compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
-                compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
-                compute_pass.dispatch(
-                    dispatch_count(surface_configuration.width >> (i + 2), 8),
-                    dispatch_count(surface_configuration.height >> (i + 2), 8),
-                    1,
-                );
-            }
-
-            compute_pass.set_pipeline(&upsample_pipeline);
-
-            for i in (0..bloom_mips - 1).rev() {
-                let mut src = &mip_chain_a;
-                let mut dst = &mip_chain_b;
-
-                if i % 2 == 0 {
-                    std::mem::swap(&mut src, &mut dst);
-                }
-
-                compute_pass.set_bind_group(0, &src.sampled_texture_bind_group, &[]);
-                compute_pass.set_bind_group(1, &dst.storage_mips_bind_group, &[]);
-                compute_pass.set_push_constants(0, bytemuck::bytes_of(&(i as u32)));
-                compute_pass.dispatch(
-                    dispatch_count(surface_configuration.width >> (i + 1), 8),
-                    dispatch_count(surface_configuration.height >> (i + 1), 8),
-                    1,
-                );
-            }
-
-            compute_pass.set_pipeline(&upsample_final_pipeline);
-            compute_pass.set_bind_group(0, &mip_chain_a.sampled_texture_bind_group, &[]);
-            compute_pass.set_bind_group(1, &hdr_texture_storage_bind_group, &[]);
-            compute_pass.dispatch(
-                dispatch_count(surface_configuration.width, 8),
-                dispatch_count(surface_configuration.height, 8),
-                1,
-            );
-
-            drop(compute_pass);
-
-            let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tonemap render pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
-                    },
-                }],
-                depth_stencil_attachment: None,
-            });
-
-            render_pass.set_pipeline(&tonemap_pipeline);
-            render_pass.set_bind_group(0, &hdr_texture_bind_group, &[]);
-            render_pass.set_push_constants(
-                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&colstodian::tonemap::BakedLottesTonemapperParams::from(
-                    colstodian::tonemap::LottesTonemapperParams {
-                        ..Default::default()
-                    },
-                )),
-            );
-            render_pass.draw(0..3, 0..1);
-
-            drop(render_pass);
-
-            queue.submit(std::iter::once(command_encoder.finish()));
-
-            texture.present();
-        }
-        _ => {}
     });
 }
 
@@ -715,7 +776,6 @@ impl MipChain {
         device: &wgpu::Device,
         surface_configuration: &wgpu::SurfaceConfiguration,
         mip_levels: u32,
-        max_mips: u32,
         bloom_texture_bgl: &wgpu::BindGroupLayout,
         sampled_texture_bgl: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
@@ -737,7 +797,7 @@ impl MipChain {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
-        let dummy_mips = std::iter::repeat(mip_levels - 1).take((max_mips - mip_levels) as usize);
+        let dummy_mips = std::iter::repeat(mip_levels - 1).take((MAX_MIPS - mip_levels) as usize);
 
         let views: Vec<_> = (0..mip_levels)
             .map(|i| {
@@ -749,7 +809,10 @@ impl MipChain {
             })
             .collect();
 
-        let view_refs: Vec<_> = (0..mip_levels).chain(dummy_mips).map(|i| &views[i as usize]).collect();
+        let view_refs: Vec<_> = (0..mip_levels)
+            .chain(dummy_mips)
+            .map(|i| &views[i as usize])
+            .collect();
 
         Self {
             storage_mips_bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -766,7 +829,9 @@ impl MipChain {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture.create_view(&Default::default())),
+                        resource: wgpu::BindingResource::TextureView(
+                            &texture.create_view(&Default::default()),
+                        ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
