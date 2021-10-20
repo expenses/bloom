@@ -166,7 +166,7 @@ pub fn downsample_initial(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&bloom_texture, id);
 
-    let sample = sample_13_tap_box((hdr_texture, sampler), uv, texel_size, 0);
+    let sample = sample_13_tap_box_filter((hdr_texture, sampler), uv, texel_size, 0);
 
     let thresholded =
         quadratic_colour_thresholding(sample, filter_constants.threshold, filter_constants.knee);
@@ -191,8 +191,8 @@ pub fn downsample(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
 
-    let sample =
-        sample_13_tap_box((source_texture, sampler), uv, texel_size, *source_mip).extend(1.0);
+    let sample = sample_13_tap_box_filter((source_texture, sampler), uv, texel_size, *source_mip)
+        .extend(1.0);
 
     unsafe {
         destination_texture.write(id, sample);
@@ -214,8 +214,8 @@ pub fn upsample(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
 
-    let sample =
-        sample_3x3_tent((source_texture, sampler), uv, texel_size, *dest_mip + 1).extend(1.0);
+    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size, *dest_mip + 1)
+        .extend(1.0);
 
     let existing_sample: Vec4 = destination_texture.read(id);
 
@@ -234,7 +234,7 @@ pub fn upsample_final(
 ) {
     let (texel_size, uv) = calculate_texel_size_and_uv(&hdr_texture, id);
 
-    let sample = sample_3x3_tent((source_texture, sampler), uv, texel_size, 0).extend(1.0);
+    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size, 0).extend(1.0);
 
     let existing_sample: Vec4 = hdr_texture.read(id);
 
@@ -272,9 +272,9 @@ impl CombinedTextureSampler for &SampledImage<Image!(2D, type = f32, sampled)> {
 // . K . L . M .
 // . . . . . . .
 // These samples are interpreted as 4 overlapping boxes
-// plus a center box to produce a box blur.
+// plus a center box.
 #[rustfmt::skip]
-fn sample_13_tap_box<T: CombinedTextureSampler>(
+fn sample_13_tap_box_filter<T: CombinedTextureSampler>(
     texture: T,
     uv: Vec2,
     texel_size: Vec2,
@@ -301,6 +301,8 @@ fn sample_13_tap_box<T: CombinedTextureSampler>(
     let bottom_left = f + g + k + l;
     let bottom_right = g + h + l + m;
 
+    // The center box (after having been averaged by dividing by 4) has a weight of 0.5
+    // and the other boxes have a weight of 0.125.
     center_pixels * 0.25 * 0.5 + (top_left + top_right + bottom_left + bottom_right) * 0.25 * 0.125
 }
 
@@ -310,7 +312,7 @@ fn sample_13_tap_box<T: CombinedTextureSampler>(
 // 1/16 * d*2 e*4 f*2
 //        g*1 h*2 i*1
 #[rustfmt::skip]
-fn sample_3x3_tent<T: CombinedTextureSampler>(
+fn sample_3x3_tent_filter<T: CombinedTextureSampler>(
     texture: T,
     uv: Vec2,
     texel_size: Vec2,
