@@ -3,6 +3,7 @@ use wgpu::util::DeviceExt;
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::ControlFlow;
 use winit::window::Fullscreen;
+use rendering_shaders::FilterConstants;
 
 // I get 10 mip levels on a 2560 x 1600 display, so 12 is probably enough even for 4k.
 const MAX_MIPS: u32 = 12;
@@ -914,13 +915,6 @@ impl BloomTextureWithMips {
             }),
         }
     }
-}
-
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct FilterConstants {
-    threshold: f32,
-    knee: f32,
 }
 
 #[derive(Default)]

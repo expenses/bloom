@@ -20,6 +20,7 @@ pollster = "0.2.4"
 ultraviolet = { version = "0.8.1", features = ["bytemuck"] }
 wgpu = { version = "0.11.0", features = ["spirv"] }
 winit = "0.25.0"
+rendering-shaders = { path = "shaders/rendering" }
 
 
 [workspace]

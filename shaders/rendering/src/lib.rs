@@ -9,8 +9,13 @@
 extern crate spirv_std;
 
 use spirv_std::glam::{IVec2, Mat4, UVec2, Vec2, Vec3, Vec4};
-use spirv_std::num_traits::Float;
 use spirv_std::{image::SampledImage, Image, RuntimeArray, Sampler};
+
+#[cfg(target_arch = "spirv")]
+use spirv_std::num_traits::Float;
+
+#[cfg(not(target_arch = "spirv"))]
+use spirv_std::macros::spirv;
 
 #[spirv(vertex)]
 pub fn vertex(
@@ -82,8 +87,6 @@ impl LottesTonemapper {
     }
 
     fn tonemap(&self, color: Vec3, params: BakedLottesTonemapperParams) -> Vec3 {
-        let color = color;
-
         let max = color.max_element();
         let mut ratio = color / max;
         let tonemapped_max = Self::tonemap_inner(max, params);
@@ -146,9 +149,11 @@ fn calculate_texel_size_and_uv(
     (texel_size, uv)
 }
 
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub struct FilterConstants {
-    threshold: f32,
-    knee: f32,
+    pub threshold: f32,
+    pub knee: f32,
 }
 
 // Sample and filter the input HDR texture into the 0th half-size mip of the bloom texture.
@@ -164,10 +169,16 @@ pub fn downsample_initial(
 ) {
     let bloom_texture = unsafe { bloom_texture_mips.index(0) };
 
-    let (texel_size, uv) = calculate_texel_size_and_uv(&bloom_texture, id);
+    let (texel_size, uv) = calculate_texel_size_and_uv(bloom_texture, id);
 
     let sample = sample_13_tap_box_filter((hdr_texture, sampler), uv, texel_size, 0);
 
+    // Threshold the colours based on a quadratic curve set by the constants.
+    // An alternative to doing this (and what's used in the original presentation)
+    // is to use a karis average: http://graphicrants.blogspot.com/2013/12/tone-mapping.html
+    //
+    // You don't get as much control with that as this colour thresholding though, so I'm using
+    // this instead.
     let thresholded =
         quadratic_colour_thresholding(sample, filter_constants.threshold, filter_constants.knee);
 
@@ -189,7 +200,7 @@ pub fn downsample(
 ) {
     let destination_texture = unsafe { destination_textures.index((*source_mip + 1) as usize) };
 
-    let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
+    let (texel_size, uv) = calculate_texel_size_and_uv(destination_texture, id);
 
     let sample = sample_13_tap_box_filter((source_texture, sampler), uv, texel_size, *source_mip)
         .extend(1.0);
@@ -197,6 +208,13 @@ pub fn downsample(
     unsafe {
         destination_texture.write(id, sample);
     }
+}
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct UpsampleParams {
+    pub dest_mip: u32,
+    pub scale: f32,
 }
 
 // Sample the bloom texture at mip N + 1, perform additive blending with the texture at mip N and write to mip N.
@@ -208,13 +226,13 @@ pub fn upsample(
         Image!(2D, format=rgba16f, sampled=false),
     >,
     #[spirv(global_invocation_id)] id: IVec2,
-    #[spirv(push_constant)] dest_mip: &u32,
+    #[spirv(push_constant)] params: &UpsampleParams,
 ) {
-    let destination_texture = unsafe { destination_textures.index(*dest_mip as usize) };
+    let destination_texture = unsafe { destination_textures.index(params.dest_mip as usize) };
 
-    let (texel_size, uv) = calculate_texel_size_and_uv(&destination_texture, id);
+    let (texel_size, uv) = calculate_texel_size_and_uv(destination_texture, id);
 
-    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size, *dest_mip + 1)
+    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size * params.scale, params.dest_mip + 1)
         .extend(1.0);
 
     let existing_sample: Vec4 = destination_texture.read(id);
@@ -231,10 +249,11 @@ pub fn upsample_final(
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] hdr_texture: &Image!(2D, format=rgba16f, sampled=false),
     #[spirv(global_invocation_id)] id: IVec2,
+    #[spirv(push_constant)] scale: &f32,
 ) {
-    let (texel_size, uv) = calculate_texel_size_and_uv(&hdr_texture, id);
+    let (texel_size, uv) = calculate_texel_size_and_uv(hdr_texture, id);
 
-    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size, 0).extend(1.0);
+    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size * *scale, 0).extend(1.0);
 
     let existing_sample: Vec4 = hdr_texture.read(id);
 
@@ -274,6 +293,7 @@ impl CombinedTextureSampler for &SampledImage<Image!(2D, type = f32, sampled)> {
 // These samples are interpreted as 4 overlapping boxes
 // plus a center box.
 #[rustfmt::skip]
+#[allow(clippy::many_single_char_names)]
 fn sample_13_tap_box_filter<T: CombinedTextureSampler>(
     texture: T,
     uv: Vec2,
@@ -312,6 +332,7 @@ fn sample_13_tap_box_filter<T: CombinedTextureSampler>(
 // 1/16 * d*2 e*4 f*2
 //        g*1 h*2 i*1
 #[rustfmt::skip]
+#[allow(clippy::many_single_char_names)]
 fn sample_3x3_tent_filter<T: CombinedTextureSampler>(
     texture: T,
     uv: Vec2,
