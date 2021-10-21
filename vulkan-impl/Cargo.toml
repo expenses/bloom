@@ -1,8 +1,7 @@
 [package]
-name = "bloom"
+name = "vulkan-impl"
 version = "0.1.0"
 edition = "2018"
-resolver = "2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -11,17 +10,15 @@ anyhow = "1.0.44"
 bytemuck = { version = "1.7.2", features = ["derive"] }
 colstodian = { git = "https://github.com/termhn/colstodian" }
 dolly = "0.1.3"
-egui = "0.14.2"
-egui_wgpu_backend = "0.13.0"
-egui_winit_platform = "0.10.0"
 gltf = { version = "0.16.0", default-features = false, features = ["utils"] }
 image = { version = "0.23.14", features = ["png"], default-features = false }
-pollster = "0.2.4"
 ultraviolet = { version = "0.8.1", features = ["bytemuck"] }
-wgpu = { version = "0.11.0", features = ["spirv"] }
+rendering-shaders = { path = "../shaders/rendering" }
+ash = "0.33.3"
+ash-window = "0.7.0"
+gpu-allocator = "0.10.0"
+simplelog = "0.10.2"
+vulkan-common = { path = "vulkan-common" }
 winit = "0.25.0"
-rendering-shaders = { path = "shaders/rendering" }
+log = "0.4.14"
 vk-sync = { git = "https://github.com/expenses/vk-sync-rs" }
-
-[workspace]
-members = [".", "compile-shaders", "shaders/rendering", "vulkan-impl", "vulkan-impl/vulkan-common"]

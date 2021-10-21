@@ -68,10 +68,23 @@ pub fn fullscreen_tri(
     let pos = 2.0 * *uv - Vec2::ONE;
 
     *builtin_pos = Vec4::new(pos.x, pos.y, 0.0, 1.0);
+}
+
+#[spirv(vertex)]
+pub fn fullscreen_tri_wgpu(
+    #[spirv(vertex_index)] vert_idx: i32,
+    uv: &mut Vec2,
+    #[spirv(position)] builtin_pos: &mut Vec4,
+) {
+    *uv = Vec2::new(((vert_idx << 1) & 2) as f32, (vert_idx & 2) as f32);
+    let pos = 2.0 * *uv - Vec2::ONE;
+
+    *builtin_pos = Vec4::new(pos.x, pos.y, 0.0, 1.0);
 
     // Flipped on Y for webgpu.
     uv.y = 1.0 - uv.y;
 }
+
 
 // This is just lifted from
 // https://github.com/termhn/colstodian/blob/f2fb0f55d94644dbb753edd5c01da9a08f0e2d3f/src/tonemap.rs#L187-L220
@@ -232,8 +245,13 @@ pub fn upsample(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(destination_texture, id);
 
-    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size * params.scale, params.dest_mip + 1)
-        .extend(1.0);
+    let sample = sample_3x3_tent_filter(
+        (source_texture, sampler),
+        uv,
+        texel_size * params.scale,
+        params.dest_mip + 1,
+    )
+    .extend(1.0);
 
     let existing_sample: Vec4 = destination_texture.read(id);
 
@@ -253,7 +271,8 @@ pub fn upsample_final(
 ) {
     let (texel_size, uv) = calculate_texel_size_and_uv(hdr_texture, id);
 
-    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size * *scale, 0).extend(1.0);
+    let sample =
+        sample_3x3_tent_filter((source_texture, sampler), uv, texel_size * *scale, 0).extend(1.0);
 
     let existing_sample: Vec4 = hdr_texture.read(id);
 

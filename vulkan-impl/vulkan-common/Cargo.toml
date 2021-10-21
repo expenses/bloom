@@ -1,0 +1,13 @@
+[package]
+name = "vulkan-common"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.44"
+ash = "0.33.3"
+gpu-allocator = "0.10.0"
+log = "0.4.14"
+vk-sync = { git = "https://github.com/expenses/vk-sync-rs" }

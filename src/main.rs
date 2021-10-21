@@ -1,9 +1,9 @@
+use rendering_shaders::FilterConstants;
 use ultraviolet::{Mat4, Vec2, Vec3};
 use wgpu::util::DeviceExt;
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::ControlFlow;
 use winit::window::Fullscreen;
-use rendering_shaders::FilterConstants;
 
 // I get 10 mip levels on a 2560 x 1600 display, so 12 is probably enough even for 4k.
 const MAX_MIPS: u32 = 12;
@@ -114,7 +114,7 @@ fn main() -> anyhow::Result<()> {
 
     let fullscreen_tri_module = unsafe {
         device
-            .create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/fullscreen_tri.spv"))
+            .create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/fullscreen_tri_wgpu.spv"))
     };
     let tonemap_module = unsafe {
         device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/tonemap.spv"))
@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
         layout: Some(&base_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &fullscreen_tri_module,
-            entry_point: "fullscreen_tri",
+            entry_point: "fullscreen_tri_wgpu",
             buffers: &[],
         },
         primitive: wgpu::PrimitiveState {

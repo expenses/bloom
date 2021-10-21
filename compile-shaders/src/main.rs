@@ -15,7 +15,7 @@ fn compile_shader_multi(
     extensions: &[&str],
     capabilities: &[Capability],
 ) -> anyhow::Result<()> {
-    let mut builder = SpirvBuilder::new(path, "spirv-unknown-spv1.1")
+    let mut builder = SpirvBuilder::new(path, "spirv-unknown-spv1.0")
         .print_metadata(MetadataPrintout::None)
         .multimodule(true);
 
