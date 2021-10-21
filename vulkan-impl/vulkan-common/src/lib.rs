@@ -313,7 +313,7 @@ impl<'a> GraphicsPipelineDescriptor<'a> {
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1),
             colour_blend_state: vk::PipelineColorBlendStateCreateInfo::builder()
                 .logic_op_enable(false)
-                .attachments(&self.colour_attachments),
+                .attachments(self.colour_attachments),
         }
     }
 }
@@ -437,7 +437,7 @@ pub fn create_image_from_bytes(
 
     unsafe {
         vk_sync::cmd::pipeline_barrier(
-            &init_resources.device,
+            init_resources.device,
             init_resources.command_buffer,
             None,
             &[],
@@ -470,7 +470,7 @@ pub fn create_image_from_bytes(
         );
 
         vk_sync::cmd::pipeline_barrier(
-            &init_resources.device,
+            init_resources.device,
             init_resources.command_buffer,
             None,
             &[],
@@ -527,7 +527,7 @@ impl Buffer {
             linear: true,
         })?;
 
-        Self::from_parts(allocation, buffer, bytes, name, &init_resources.device)
+        Self::from_parts(allocation, buffer, bytes, name, init_resources.device)
     }
 
     fn from_parts(
@@ -627,13 +627,13 @@ impl Image {
         };
 
         let subresource_range = *vk::ImageSubresourceRange::builder()
-                            .aspect_mask(if format == vk::Format::D32_SFLOAT {
-                                vk::ImageAspectFlags::DEPTH
-                            } else {
-                                vk::ImageAspectFlags::COLOR
-                            })
-                            .level_count(1)
-                            .layer_count(1);
+            .aspect_mask(if format == vk::Format::D32_SFLOAT {
+                vk::ImageAspectFlags::DEPTH
+            } else {
+                vk::ImageAspectFlags::COLOR
+            })
+            .level_count(1)
+            .layer_count(1);
 
         let view = unsafe {
             init_resources.device.create_image_view(
@@ -647,7 +647,7 @@ impl Image {
         }?;
 
         vk_sync::cmd::pipeline_barrier(
-            &init_resources.device,
+            init_resources.device,
             init_resources.command_buffer,
             None,
             &[],
@@ -667,6 +667,17 @@ impl Image {
             view,
             allocation,
         })
+    }
+
+    pub fn cleanup(&self, device: &ash::Device, allocator: &mut Allocator) -> anyhow::Result<()> {
+        allocator.free(self.allocation.clone())?;
+
+        unsafe {
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None)
+        }
+
+        Ok(())
     }
 }
 

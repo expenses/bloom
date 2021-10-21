@@ -113,8 +113,9 @@ fn main() -> anyhow::Result<()> {
     });
 
     let fullscreen_tri_module = unsafe {
-        device
-            .create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/fullscreen_tri_wgpu.spv"))
+        device.create_shader_module_spirv(&wgpu::include_spirv_raw!(
+            "../shaders/fullscreen_tri_wgpu.spv"
+        ))
     };
     let tonemap_module = unsafe {
         device.create_shader_module_spirv(&wgpu::include_spirv_raw!("../shaders/tonemap.spv"))

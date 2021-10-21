@@ -85,7 +85,6 @@ pub fn fullscreen_tri_wgpu(
     uv.y = 1.0 - uv.y;
 }
 
-
 // This is just lifted from
 // https://github.com/termhn/colstodian/blob/f2fb0f55d94644dbb753edd5c01da9a08f0e2d3f/src/tonemap.rs#L187-L220
 // because rust-gpu support is hard.

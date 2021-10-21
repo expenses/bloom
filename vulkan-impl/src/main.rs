@@ -2,7 +2,7 @@ use ash::extensions::ext::DebugUtils as DebugUtilsLoader;
 use ash::extensions::khr::{Surface as SurfaceLoader, Swapchain as SwapchainLoader};
 use ash::vk;
 use std::ffi::{CStr, CString};
-use ultraviolet::{Vec2, Vec3, Mat4};
+use ultraviolet::{Mat4, Vec2, Vec3};
 use vulkan_common::CStrList;
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::ControlFlow;
@@ -54,8 +54,8 @@ fn main() -> anyhow::Result<()> {
         entry.create_instance(
             &vk::InstanceCreateInfo::builder()
                 .application_info(&app_info)
-                .enabled_extension_names(&instance_extensions.pointers())
-                .enabled_layer_names(&enabled_layers.pointers())
+                .enabled_extension_names(instance_extensions.pointers())
+                .enabled_layer_names(enabled_layers.pointers())
                 .push_next(&mut debug_messenger_info),
             None,
         )
@@ -98,8 +98,8 @@ fn main() -> anyhow::Result<()> {
         let device_info = vk::DeviceCreateInfo::builder()
             .queue_create_infos(&queue_info)
             .enabled_features(&device_features)
-            .enabled_extension_names(&device_extensions.pointers())
-            .enabled_layer_names(&enabled_layers.pointers());
+            .enabled_extension_names(device_extensions.pointers())
+            .enabled_layer_names(enabled_layers.pointers());
 
         unsafe { instance.create_device(physical_device, &device_info, None) }?
     };
@@ -178,21 +178,21 @@ fn main() -> anyhow::Result<()> {
         height: window_size.height,
     };
 
-    let hdr_framebuffer = vulkan_common::Image::new(
+    let mut hdr_framebuffer = vulkan_common::Image::new(
         extent.width,
         extent.height,
         "hdr framebuffer",
         vk::Format::R16G16B16A16_SFLOAT,
         &mut init_resources,
-        vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         &[vk_sync::AccessType::ColorAttachmentWrite],
         vk_sync::ImageLayout::Optimal,
     )?;
 
-    let depthbuffer = vulkan_common::Image::new(
+    let mut depthbuffer = vulkan_common::Image::new(
         extent.width,
         extent.height,
-        "depth",
+        "depthbuffer",
         vk::Format::D32_SFLOAT,
         &mut init_resources,
         vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
@@ -227,12 +227,12 @@ fn main() -> anyhow::Result<()> {
                 .pool_sizes(&[
                     *vk::DescriptorPoolSize::builder()
                         .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                        .descriptor_count(1),
+                        .descriptor_count(2),
                     *vk::DescriptorPoolSize::builder()
                         .ty(vk::DescriptorType::SAMPLER)
-                        .descriptor_count(1),
+                        .descriptor_count(2),
                 ])
-                .max_sets(1),
+                .max_sets(2),
             None,
         )
     }?;
@@ -240,12 +240,16 @@ fn main() -> anyhow::Result<()> {
     let descriptor_sets = unsafe {
         device.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::builder()
-                .set_layouts(&[descriptor_set_layouts.sampled_texture])
+                .set_layouts(&[
+                    descriptor_set_layouts.sampled_texture,
+                    descriptor_set_layouts.sampled_texture,
+                ])
                 .descriptor_pool(descriptor_pool),
         )
     }?;
 
     let descriptor_set = descriptor_sets[0];
+    let tonemap_descriptor_set = descriptor_sets[1];
 
     unsafe {
         device.update_descriptor_sets(
@@ -259,6 +263,18 @@ fn main() -> anyhow::Result<()> {
                         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
                 *vk::WriteDescriptorSet::builder()
                     .dst_set(descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)]),
+                *vk::WriteDescriptorSet::builder()
+                    .dst_set(tonemap_descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&[*vk::DescriptorImageInfo::builder()
+                        .image_view(hdr_framebuffer.view)
+                        .image_layout(vk::ImageLayout::GENERAL)]),
+                *vk::WriteDescriptorSet::builder()
+                    .dst_set(tonemap_descriptor_set)
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)]),
@@ -326,7 +342,7 @@ fn main() -> anyhow::Result<()> {
     let render_semaphore = unsafe { device.create_semaphore(&semaphore_info, None)? };
     let render_fence = unsafe { device.create_fence(&fence_info, None)? };
 
-    let swapchain_framebuffers = swapchain
+    let mut swapchain_framebuffers = swapchain
         .image_views
         .iter()
         .map(|image_view| {
@@ -345,203 +361,363 @@ fn main() -> anyhow::Result<()> {
     event_loop.run(move |event, _, control_flow| {
         //egui_platform.handle_event(&event);
 
-        match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                WindowEvent::Resized(new_size) => {}
-                WindowEvent::KeyboardInput {
-                    input:
-                        KeyboardInput {
-                            state,
-                            virtual_keycode: Some(key),
-                            ..
-                        },
-                    ..
-                } => {
-                    let is_pressed = state == ElementState::Pressed;
+        let loop_closure = || -> anyhow::Result<()> {
+            match event {
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::Resized(new_size) => {
+                        extent.width = new_size.width;
+                        extent.height = new_size.height;
 
-                    match key {
-                        VirtualKeyCode::W => keyboard_state.forwards = is_pressed,
-                        VirtualKeyCode::S => keyboard_state.backwards = is_pressed,
-                        VirtualKeyCode::A => keyboard_state.left = is_pressed,
-                        VirtualKeyCode::D => keyboard_state.right = is_pressed,
-                        VirtualKeyCode::F11 => {
-                            if is_pressed {
-                                if window.fullscreen().is_some() {
-                                    window.set_fullscreen(None);
-                                } else {
-                                    window.set_fullscreen(Some(Fullscreen::Borderless(None)))
-                                }
-                            }
-                        }
-                        VirtualKeyCode::G => {
-                            if is_pressed {
-                                cursor_grab = !cursor_grab;
+                        perspective_matrix = ultraviolet::projection::perspective_infinite_z_vk(
+                            59.0_f32.to_radians(),
+                            extent.width as f32 / extent.height as f32,
+                            0.1,
+                        );
 
-                                if cursor_grab {
-                                    window.set_cursor_position(screen_center).unwrap();
-                                }
+                        screen_center = winit::dpi::LogicalPosition::new(
+                            extent.width as f64 / 2.0,
+                            extent.height as f64 / 2.0,
+                        );
 
-                                window.set_cursor_visible(!cursor_grab);
-                                window.set_cursor_grab(cursor_grab).unwrap();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    if cursor_grab {
-                        let position = position.to_logical::<f64>(window.scale_factor());
-
-                        window.set_cursor_position(screen_center).unwrap();
-
-                        camera
-                            .driver_mut::<dolly::drivers::YawPitch>()
-                            .rotate_yaw_pitch(
-                                0.1 * (screen_center.x - position.x) as f32,
-                                0.1 * (screen_center.y - position.y) as f32,
-                            );
-                    }
-                }
-                _ => {}
-            },
-            Event::MainEventsCleared => {
-                let delta_time = 1.0 / 60.0;
-
-                let forwards = keyboard_state.forwards as i32 - keyboard_state.backwards as i32;
-                let right = keyboard_state.right as i32 - keyboard_state.left as i32;
-
-                let move_vec = camera.final_transform.rotation
-                    * dolly::glam::Vec3::new(right as f32, 0.0, -forwards as f32)
-                        .clamp_length_max(1.0);
-
-                camera
-                    .driver_mut::<dolly::drivers::Position>()
-                    .translate(move_vec * delta_time * 10.0);
-
-                camera.update(delta_time);
-
-                //egui_platform.update_time(delta_time as f64);
-
-                window.request_redraw();
-            }
-            Event::RedrawRequested(_) => {
-                unsafe {
-                    device
-                        .wait_for_fences(&[render_fence], true, u64::MAX)
-                        .unwrap();
-
-                    device.reset_fences(&[render_fence]).unwrap();
-
-                    device
-                        .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
-                        .unwrap();
-                }
-
-                match unsafe {
-                    swapchain_loader.acquire_next_image(
-                        swapchain.swapchain,
-                        u64::MAX,
-                        present_semaphore,
-                        vk::Fence::null(),
-                    )
-                } {
-                    Ok((swapchain_image_index, _suboptimal)) => {
-                        let swapchain_framebuffer =
-                            swapchain_framebuffers[swapchain_image_index as usize];
-
-                        let clear_values = [
-                         vk::ClearValue {
-                                color: vk::ClearColorValue {
-                                    float32: [0.0, 0.0, 0.0, 1.0],
-                                },
-                            },
-                            vk::ClearValue {
-                                color: vk::ClearColorValue {
-                                    float32: [0.0, 0.0, 0.0, 1.0],
-                                },
-                            },
-                            vk::ClearValue {
-                                depth_stencil: vk::ClearDepthStencilValue {
-                                    depth: 1.0,
-                                    stencil: 0,
-                                },
-                            },
-                        ];
-                        let area = vk::Rect2D {
-                            offset: vk::Offset2D { x: 0, y: 0 },
-                            extent,
-                        };
-                        let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
-                            .render_pass(graphics_pipelines.render_pass)
-                            .framebuffer(swapchain_framebuffer)
-                            .render_area(area)
-                            .clear_values(&clear_values);
-
-                        let viewport = *vk::Viewport::builder()
-                            .x(0.0)
-                            .y(0.0)
-                            .width(extent.width as f32)
-                            .height(extent.height as f32)
-                            .min_depth(0.0)
-                            .max_depth(1.0);
-
-                        let camera_view = Mat4::look_at(
-                    Vec3::from(<[f32; 3]>::from(camera.final_transform.position)),
-                    Vec3::from(<[f32; 3]>::from(
-                        camera.final_transform.position + camera.final_transform.forward(),
-                    )),
-                    Vec3::from(<[f32; 3]>::from(camera.final_transform.up())),
-                );
+                        swapchain_info.image_extent = extent;
+                        swapchain_info.old_swapchain = swapchain.swapchain;
 
                         unsafe {
-                            device
-                                .begin_command_buffer(
+                            device.queue_wait_idle(queue)?;
+                        }
+
+                        swapchain = vulkan_common::Swapchain::new(
+                            &device,
+                            &swapchain_loader,
+                            swapchain_info,
+                        )?;
+
+                        hdr_framebuffer.cleanup(&device, &mut allocator)?;
+                        depthbuffer.cleanup(&device, &mut allocator)?;
+
+                        unsafe {
+                            device.reset_command_pool(
+                                command_pool,
+                                vk::CommandPoolResetFlags::empty(),
+                            )?;
+                        }
+
+                        unsafe {
+                            device.begin_command_buffer(
+                                command_buffer,
+                                &vk::CommandBufferBeginInfo::builder()
+                                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                            )?;
+                        }
+
+                        let mut init_resources = vulkan_common::InitResources {
+                            command_buffer,
+                            device: &device,
+                            allocator: &mut allocator,
+                        };
+
+                        hdr_framebuffer = vulkan_common::Image::new(
+                            extent.width,
+                            extent.height,
+                            "hdr framebuffer",
+                            vk::Format::R16G16B16A16_SFLOAT,
+                            &mut init_resources,
+                            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                            &[vk_sync::AccessType::ColorAttachmentWrite],
+                            vk_sync::ImageLayout::Optimal,
+                        )?;
+
+                        depthbuffer = vulkan_common::Image::new(
+                            extent.width,
+                            extent.height,
+                            "depth",
+                            vk::Format::D32_SFLOAT,
+                            &mut init_resources,
+                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                            &[vk_sync::AccessType::DepthStencilAttachmentWrite],
+                            vk_sync::ImageLayout::Optimal,
+                        )?;
+
+                        drop(init_resources);
+
+                        unsafe {
+                            device.end_command_buffer(init_command_buffer)?;
+                            let fence =
+                                device.create_fence(&vk::FenceCreateInfo::builder(), None)?;
+
+                            device.queue_submit(
+                                queue,
+                                &[*vk::SubmitInfo::builder()
+                                    .command_buffers(&[init_command_buffer])],
+                                fence,
+                            )?;
+
+                            device.wait_for_fences(&[fence], true, u64::MAX)?;
+
+                            device.update_descriptor_sets(
+                                &[*vk::WriteDescriptorSet::builder()
+                                    .dst_set(tonemap_descriptor_set)
+                                    .dst_binding(0)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .image_info(&[*vk::DescriptorImageInfo::builder()
+                                        .image_view(hdr_framebuffer.view)
+                                        .image_layout(vk::ImageLayout::GENERAL)])],
+                                &[],
+                            );
+                        }
+
+                        swapchain_framebuffers = swapchain
+                            .image_views
+                            .iter()
+                            .map(|image_view| {
+                                let attachments =
+                                    [*image_view, hdr_framebuffer.view, depthbuffer.view];
+                                let framebuffer_info = vk::FramebufferCreateInfo::builder()
+                                    .render_pass(graphics_pipelines.render_pass)
+                                    .attachments(&attachments)
+                                    .width(extent.width)
+                                    .height(extent.height)
+                                    .layers(1);
+
+                                unsafe { device.create_framebuffer(&framebuffer_info, None) }
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                    }
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                state,
+                                virtual_keycode: Some(key),
+                                ..
+                            },
+                        ..
+                    } => {
+                        let is_pressed = state == ElementState::Pressed;
+
+                        match key {
+                            VirtualKeyCode::W => keyboard_state.forwards = is_pressed,
+                            VirtualKeyCode::S => keyboard_state.backwards = is_pressed,
+                            VirtualKeyCode::A => keyboard_state.left = is_pressed,
+                            VirtualKeyCode::D => keyboard_state.right = is_pressed,
+                            VirtualKeyCode::F11 => {
+                                if is_pressed {
+                                    if window.fullscreen().is_some() {
+                                        window.set_fullscreen(None);
+                                    } else {
+                                        window.set_fullscreen(Some(Fullscreen::Borderless(None)))
+                                    }
+                                }
+                            }
+                            VirtualKeyCode::G => {
+                                if is_pressed {
+                                    cursor_grab = !cursor_grab;
+
+                                    if cursor_grab {
+                                        window.set_cursor_position(screen_center)?;
+                                    }
+
+                                    window.set_cursor_visible(!cursor_grab);
+                                    window.set_cursor_grab(cursor_grab)?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        if cursor_grab {
+                            let position = position.to_logical::<f64>(window.scale_factor());
+
+                            window.set_cursor_position(screen_center)?;
+
+                            camera
+                                .driver_mut::<dolly::drivers::YawPitch>()
+                                .rotate_yaw_pitch(
+                                    0.1 * (screen_center.x - position.x) as f32,
+                                    0.1 * (screen_center.y - position.y) as f32,
+                                );
+                        }
+                    }
+                    _ => {}
+                },
+                Event::MainEventsCleared => {
+                    let delta_time = 1.0 / 60.0;
+
+                    let forwards = keyboard_state.forwards as i32 - keyboard_state.backwards as i32;
+                    let right = keyboard_state.right as i32 - keyboard_state.left as i32;
+
+                    let move_vec = camera.final_transform.rotation
+                        * dolly::glam::Vec3::new(right as f32, 0.0, -forwards as f32)
+                            .clamp_length_max(1.0);
+
+                    camera
+                        .driver_mut::<dolly::drivers::Position>()
+                        .translate(move_vec * delta_time * 10.0);
+
+                    camera.update(delta_time);
+
+                    //egui_platform.update_time(delta_time as f64);
+
+                    window.request_redraw();
+                }
+                Event::RedrawRequested(_) => {
+                    unsafe {
+                        device.wait_for_fences(&[render_fence], true, u64::MAX)?;
+
+                        device.reset_fences(&[render_fence])?;
+
+                        device
+                            .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())?;
+                    }
+
+                    match unsafe {
+                        swapchain_loader.acquire_next_image(
+                            swapchain.swapchain,
+                            u64::MAX,
+                            present_semaphore,
+                            vk::Fence::null(),
+                        )
+                    } {
+                        Ok((swapchain_image_index, _suboptimal)) => {
+                            let swapchain_framebuffer =
+                                swapchain_framebuffers[swapchain_image_index as usize];
+
+                            let clear_values = [
+                                vk::ClearValue {
+                                    color: vk::ClearColorValue {
+                                        float32: [0.0, 0.0, 0.0, 1.0],
+                                    },
+                                },
+                                vk::ClearValue {
+                                    color: vk::ClearColorValue {
+                                        float32: [0.0, 0.0, 0.0, 1.0],
+                                    },
+                                },
+                                vk::ClearValue {
+                                    depth_stencil: vk::ClearDepthStencilValue {
+                                        depth: 1.0,
+                                        stencil: 0,
+                                    },
+                                },
+                            ];
+                            let area = vk::Rect2D {
+                                offset: vk::Offset2D { x: 0, y: 0 },
+                                extent,
+                            };
+                            let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
+                                .render_pass(graphics_pipelines.render_pass)
+                                .framebuffer(swapchain_framebuffer)
+                                .render_area(area)
+                                .clear_values(&clear_values);
+
+                            let viewport = *vk::Viewport::builder()
+                                .x(0.0)
+                                .y(0.0)
+                                .width(extent.width as f32)
+                                .height(extent.height as f32)
+                                .min_depth(0.0)
+                                .max_depth(1.0);
+
+                            let camera_view = Mat4::look_at(
+                                Vec3::from(<[f32; 3]>::from(camera.final_transform.position)),
+                                Vec3::from(<[f32; 3]>::from(
+                                    camera.final_transform.position
+                                        + camera.final_transform.forward(),
+                                )),
+                                Vec3::from(<[f32; 3]>::from(camera.final_transform.up())),
+                            );
+
+                            unsafe {
+                                device.begin_command_buffer(
                                     command_buffer,
                                     &vk::CommandBufferBeginInfo::builder()
                                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                                )
-                                .unwrap();
+                                )?;
 
-                            device.cmd_begin_render_pass(
-                                command_buffer,
-                                &render_pass_begin_info,
-                                vk::SubpassContents::INLINE,
-                            );
+                                device.cmd_begin_render_pass(
+                                    command_buffer,
+                                    &render_pass_begin_info,
+                                    vk::SubpassContents::INLINE,
+                                );
 
-                            device.cmd_set_scissor(command_buffer, 0, &[area]);
-                            device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+                                device.cmd_set_scissor(command_buffer, 0, &[area]);
+                                device.cmd_set_viewport(command_buffer, 0, &[viewport]);
 
-                            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, graphics_pipelines.graphics_pipeline);
+                                device.cmd_bind_pipeline(
+                                    command_buffer,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    graphics_pipelines.graphics_pipeline,
+                                );
 
-                            device.cmd_bind_descriptor_sets(
-                                command_buffer,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                graphics_pipelines.general_pipeline_layout,
-                                0,
-                                &[descriptor_set],
-                                &[],
-                            );
-                            device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer.buffer], &[0]);
-                            device.cmd_bind_index_buffer(command_buffer, index_buffer.buffer, 0, vk::IndexType::UINT32);
-                            device.cmd_push_constants(
-                                command_buffer,
-                                graphics_pipelines.general_pipeline_layout,
-                                vk::ShaderStageFlags::VERTEX,
-                                0,
-                                bytemuck::bytes_of(&(perspective_matrix * camera_view)),
-                            );
+                                device.cmd_bind_descriptor_sets(
+                                    command_buffer,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    graphics_pipelines.general_pipeline_layout,
+                                    0,
+                                    &[descriptor_set],
+                                    &[],
+                                );
+                                device.cmd_bind_vertex_buffers(
+                                    command_buffer,
+                                    0,
+                                    &[vertex_buffer.buffer],
+                                    &[0],
+                                );
+                                device.cmd_bind_index_buffer(
+                                    command_buffer,
+                                    index_buffer.buffer,
+                                    0,
+                                    vk::IndexType::UINT32,
+                                );
+                                device.cmd_push_constants(
+                                    command_buffer,
+                                    graphics_pipelines.general_pipeline_layout,
+                                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                                    0,
+                                    bytemuck::bytes_of(&(perspective_matrix * camera_view)),
+                                );
 
-                            device.cmd_draw_indexed(command_buffer, num_indices, 1, 0, 0, 0);
+                                device.cmd_draw_indexed(command_buffer, num_indices, 1, 0, 0, 0);
 
-                            device.cmd_next_subpass(command_buffer, vk::SubpassContents::INLINE);
+                                device
+                                    .cmd_next_subpass(command_buffer, vk::SubpassContents::INLINE);
 
-                            device.cmd_end_render_pass(command_buffer);
+                                device.cmd_bind_pipeline(
+                                    command_buffer,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    graphics_pipelines.tonemap_pipeline,
+                                );
 
-                            device.end_command_buffer(command_buffer).unwrap();
+                                device.cmd_bind_descriptor_sets(
+                                    command_buffer,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    graphics_pipelines.general_pipeline_layout,
+                                    0,
+                                    &[tonemap_descriptor_set],
+                                    &[],
+                                );
 
-                            device
-                                .queue_submit(
+                                device.cmd_push_constants(
+                                    command_buffer,
+                                    graphics_pipelines.general_pipeline_layout,
+                                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                                    0,
+                                    bytemuck::bytes_of(
+                                        &colstodian::tonemap::BakedLottesTonemapperParams::from(
+                                            colstodian::tonemap::LottesTonemapperParams {
+                                                ..Default::default()
+                                            },
+                                        ),
+                                    ),
+                                );
+
+                                device.cmd_draw(command_buffer, 3, 1, 0, 0);
+
+                                device.cmd_end_render_pass(command_buffer);
+
+                                device.end_command_buffer(command_buffer)?;
+
+                                device.queue_submit(
                                     queue,
                                     &[*vk::SubmitInfo::builder()
                                         .wait_semaphores(&[present_semaphore])
@@ -549,24 +725,39 @@ fn main() -> anyhow::Result<()> {
                                         .command_buffers(&[command_buffer])
                                         .signal_semaphores(&[render_semaphore])],
                                     render_fence,
-                                )
-                                .unwrap();
+                                )?;
 
-                            swapchain_loader
-                                .queue_present(
+                                swapchain_loader.queue_present(
                                     queue,
                                     &vk::PresentInfoKHR::builder()
                                         .wait_semaphores(&[render_semaphore])
                                         .swapchains(&[swapchain.swapchain])
                                         .image_indices(&[swapchain_image_index]),
-                                )
-                                .unwrap();
+                                )?;
+                            }
                         }
+                        Err(error) => log::warn!("Next frame error: {:?}", error),
                     }
-                    Err(error) => log::warn!("Next frame error: {:?}", error),
                 }
+                Event::LoopDestroyed => {
+                    unsafe {
+                        device.queue_wait_idle(queue)?;
+                    }
+
+                    texture.cleanup(&device, &mut allocator)?;
+                    hdr_framebuffer.cleanup(&device, &mut allocator)?;
+                    depthbuffer.cleanup(&device, &mut allocator)?;
+                    vertex_buffer.cleanup(&device, &mut allocator)?;
+                    index_buffer.cleanup(&device, &mut allocator)?;
+                }
+                _ => {}
             }
-            _ => {}
+
+            Ok(())
+        };
+
+        if let Err(loop_closure) = loop_closure() {
+            log::error!("Error: {}", loop_closure);
         }
     });
 }
@@ -582,6 +773,7 @@ struct KeyboardState {
 struct GraphicsPipelines {
     render_pass: vk::RenderPass,
     graphics_pipeline: vk::Pipeline,
+    tonemap_pipeline: vk::Pipeline,
     general_pipeline_layout: vk::PipelineLayout,
 }
 
@@ -608,7 +800,7 @@ impl GraphicsPipelines {
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
-                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
                 // Depth buffer
                 *vk::AttachmentDescription::builder()
                     .format(vk::Format::D32_SFLOAT)
@@ -624,7 +816,7 @@ impl GraphicsPipelines {
 
             let color_attachment_refs = [*vk::AttachmentReference::builder()
                 .attachment(1)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+                .layout(vk::ImageLayout::GENERAL)];
 
             let depth_attachment_ref = *vk::AttachmentReference::builder()
                 .attachment(2)
@@ -633,19 +825,17 @@ impl GraphicsPipelines {
             let subpasses = [
                 *vk::SubpassDescription::builder()
                     .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(&swapchain_framebuffer_ref)
-                                        .depth_stencil_attachment(&depth_attachment_ref),
-                *vk::SubpassDescription::builder()
-                    .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                     .color_attachments(&color_attachment_refs)
                     .depth_stencil_attachment(&depth_attachment_ref),
+                *vk::SubpassDescription::builder()
+                    .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                    .color_attachments(&swapchain_framebuffer_ref),
             ];
 
             let subpass_dependencies = [
                 *vk::SubpassDependency::builder()
                     .src_subpass(vk::SUBPASS_EXTERNAL)
                     .dst_subpass(0)
-                    // todo: top of pipe?
                     .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
                     .src_access_mask(vk::AccessFlags::empty())
                     .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
@@ -653,7 +843,6 @@ impl GraphicsPipelines {
                 *vk::SubpassDependency::builder()
                     .src_subpass(0)
                     .dst_subpass(1)
-                    // todo: top of pipe?
                     .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ)
                     .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
@@ -689,18 +878,36 @@ impl GraphicsPipelines {
             &fragment_entry_point,
         )?;
 
+        let fullscreen_tri_entry_point = CString::new("fullscreen_tri")?;
+
+        let fullscreen_tri_stage = load_shader_module_as_stage(
+            include_bytes!("../../shaders/fullscreen_tri.spv"),
+            vk::ShaderStageFlags::VERTEX,
+            device,
+            &fullscreen_tri_entry_point,
+        )?;
+
+        let tonemap_entry_point = CString::new("tonemap")?;
+
+        let tonemap_stage = load_shader_module_as_stage(
+            include_bytes!("../../shaders/tonemap.spv"),
+            vk::ShaderStageFlags::FRAGMENT,
+            device,
+            &tonemap_entry_point,
+        )?;
+
         let general_pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::builder()
                     .set_layouts(&[descriptor_set_layouts.sampled_texture])
                     .push_constant_ranges(&[*vk::PushConstantRange::builder()
-                        .stage_flags(vk::ShaderStageFlags::VERTEX)
+                        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                         .size(128)]),
                 None,
             )
         }?;
 
-        let graphics_pipeline = {
+        let pipelines = {
             let stages = &[*vertex_stage, *fragment_stage];
 
             let graphics_pipeline_desc = vulkan_common::GraphicsPipelineDescriptor {
@@ -732,21 +939,46 @@ impl GraphicsPipelines {
             let graphics_pipeline_desc =
                 baked.as_pipeline_create_info(stages, general_pipeline_layout, render_pass, 0);
 
-            let pipelines = unsafe {
+            let tonemap_pipeline = vulkan_common::GraphicsPipelineDescriptor {
+                primitive_state: vulkan_common::PrimitiveState {
+                    cull_mode: vk::CullModeFlags::NONE,
+                },
+                depth_stencil_state: vulkan_common::DepthStencilState {
+                    depth_test_enable: false,
+                    depth_write_enable: false,
+                    depth_compare_op: vk::CompareOp::ALWAYS,
+                },
+                vertex_attributes: &[],
+                vertex_bindings: &[],
+                colour_attachments: &[*vk::PipelineColorBlendAttachmentState::builder()
+                    .color_write_mask(vk::ColorComponentFlags::all())
+                    .blend_enable(false)],
+            };
+
+            let tonemap_baked = tonemap_pipeline.as_baked();
+            let tonemap_stages = &[*fullscreen_tri_stage, *tonemap_stage];
+
+            let tonemap_desc = tonemap_baked.as_pipeline_create_info(
+                tonemap_stages,
+                general_pipeline_layout,
+                render_pass,
+                1,
+            );
+
+            unsafe {
                 device.create_graphics_pipelines(
                     vk::PipelineCache::null(),
-                    &[*graphics_pipeline_desc],
+                    &[*graphics_pipeline_desc, *tonemap_desc],
                     None,
                 )
             }
-            .map_err(|(_, err)| err)?;
-
-            pipelines[0]
+            .map_err(|(_, err)| err)?
         };
 
         Ok(Self {
             render_pass,
-            graphics_pipeline,
+            graphics_pipeline: pipelines[0],
+            tonemap_pipeline: pipelines[1],
             general_pipeline_layout,
         })
     }
