@@ -44,7 +44,7 @@ impl ComputePipelines {
         }?;
 
         let downsample_initial_stage = load_shader_module_as_stage(
-            include_bytes!("../../../shaders/downsample_initial.spv"),
+            include_bytes!("../../shaders/downsample_initial.spv"),
             vk::ShaderStageFlags::COMPUTE,
             device,
             b"downsample_initial\0",
@@ -55,7 +55,7 @@ impl ComputePipelines {
             .layout(bloom_pipeline_layout);
 
         let downsample_stage = load_shader_module_as_stage(
-            include_bytes!("../../../shaders/downsample.spv"),
+            include_bytes!("../../shaders/downsample.spv"),
             vk::ShaderStageFlags::COMPUTE,
             device,
             b"downsample\0",
@@ -66,7 +66,7 @@ impl ComputePipelines {
             .layout(bloom_pipeline_layout);
 
         let upsample_stage = load_shader_module_as_stage(
-            include_bytes!("../../../shaders/upsample.spv"),
+            include_bytes!("../../shaders/upsample.spv"),
             vk::ShaderStageFlags::COMPUTE,
             device,
             b"upsample\0",
@@ -77,7 +77,7 @@ impl ComputePipelines {
             .layout(bloom_pipeline_layout);
 
         let upsample_final_stage = load_shader_module_as_stage(
-            include_bytes!("../../../shaders/upsample_final.spv"),
+            include_bytes!("../../shaders/upsample_final.spv"),
             vk::ShaderStageFlags::COMPUTE,
             device,
             b"upsample_final\0",
