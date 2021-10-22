@@ -5,7 +5,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-// A list of C strings and their associated pointers
+/// A list of C strings and their associated pointers
 pub struct CStrList<'a> {
     list: Vec<&'a CStr>,
     pointers: Vec<*const c_char>,
@@ -271,6 +271,8 @@ pub unsafe extern "system" fn vulkan_debug_utils_callback(
 
 pub struct PrimitiveState {
     pub cull_mode: vk::CullModeFlags,
+    pub topology: vk::PrimitiveTopology,
+    pub polygon_mode: vk::PolygonMode,
 }
 
 pub struct DepthStencilState {
@@ -281,7 +283,7 @@ pub struct DepthStencilState {
 
 pub struct GraphicsPipelineDescriptor<'a> {
     pub primitive_state: PrimitiveState,
-    pub depth_stencil_state: DepthStencilState,
+    pub depth_stencil_state: Option<DepthStencilState>,
     pub vertex_bindings: &'a [vk::VertexInputBindingDescription],
     pub vertex_attributes: &'a [vk::VertexInputAttributeDescription],
     pub colour_attachments: &'a [vk::PipelineColorBlendAttachmentState],
@@ -291,9 +293,9 @@ impl<'a> GraphicsPipelineDescriptor<'a> {
     pub fn as_baked(&self) -> BakedGraphicsPipelineDescriptor {
         BakedGraphicsPipelineDescriptor {
             input_assembly: vk::PipelineInputAssemblyStateCreateInfo::builder()
-                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+                .topology(self.primitive_state.topology),
             rasterisation_state: vk::PipelineRasterizationStateCreateInfo::builder()
-                .polygon_mode(vk::PolygonMode::FILL)
+                .polygon_mode(self.primitive_state.polygon_mode)
                 .cull_mode(self.primitive_state.cull_mode)
                 .line_width(1.0),
             vertex_input: vk::PipelineVertexInputStateCreateInfo::builder()
@@ -304,10 +306,10 @@ impl<'a> GraphicsPipelineDescriptor<'a> {
                 .scissor_count(1),
             dynamic_state: vk::PipelineDynamicStateCreateInfo::builder()
                 .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]),
-            depth_stencil: vk::PipelineDepthStencilStateCreateInfo::builder()
-                .depth_test_enable(self.depth_stencil_state.depth_test_enable)
-                .depth_write_enable(self.depth_stencil_state.depth_write_enable)
-                .depth_compare_op(self.depth_stencil_state.depth_compare_op),
+            depth_stencil: self.depth_stencil_state.as_ref().map(|state| vk::PipelineDepthStencilStateCreateInfo::builder()
+                .depth_test_enable(state.depth_test_enable)
+                .depth_write_enable(state.depth_write_enable)
+                .depth_compare_op(state.depth_compare_op)),
             multisample_state: vk::PipelineMultisampleStateCreateInfo::builder()
                 .sample_shading_enable(false)
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1),
@@ -324,7 +326,7 @@ pub struct BakedGraphicsPipelineDescriptor<'a> {
     pub vertex_input: vk::PipelineVertexInputStateCreateInfoBuilder<'a>,
     pub viewport_state: vk::PipelineViewportStateCreateInfoBuilder<'a>,
     pub dynamic_state: vk::PipelineDynamicStateCreateInfoBuilder<'a>,
-    pub depth_stencil: vk::PipelineDepthStencilStateCreateInfoBuilder<'a>,
+    pub depth_stencil: Option<vk::PipelineDepthStencilStateCreateInfoBuilder<'a>>,
     pub multisample_state: vk::PipelineMultisampleStateCreateInfoBuilder<'a>,
     pub colour_blend_state: vk::PipelineColorBlendStateCreateInfoBuilder<'a>,
 }
@@ -337,7 +339,7 @@ impl<'a> BakedGraphicsPipelineDescriptor<'a> {
         render_pass: vk::RenderPass,
         subpass: u32,
     ) -> vk::GraphicsPipelineCreateInfoBuilder<'a> {
-        vk::GraphicsPipelineCreateInfo::builder()
+        let mut builder = vk::GraphicsPipelineCreateInfo::builder()
             .stages(stages)
             .vertex_input_state(&self.vertex_input)
             .input_assembly_state(&self.input_assembly)
@@ -346,10 +348,15 @@ impl<'a> BakedGraphicsPipelineDescriptor<'a> {
             .multisample_state(&self.multisample_state)
             .color_blend_state(&self.colour_blend_state)
             .dynamic_state(&self.dynamic_state)
-            .depth_stencil_state(&self.depth_stencil)
             .layout(pipeline_layout)
             .render_pass(render_pass)
-            .subpass(subpass)
+            .subpass(subpass);
+
+        if let Some(depth_stencil) = self.depth_stencil.as_ref() {
+            builder = builder.depth_stencil_state(depth_stencil);
+        }
+
+        builder
     }
 }
 

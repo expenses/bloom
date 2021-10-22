@@ -1281,12 +1281,14 @@ impl GraphicsPipelines {
             let graphics_pipeline_desc = vulkan_common::GraphicsPipelineDescriptor {
                 primitive_state: vulkan_common::PrimitiveState {
                     cull_mode: vk::CullModeFlags::BACK,
+                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                    polygon_mode: vk::PolygonMode::FILL
                 },
-                depth_stencil_state: vulkan_common::DepthStencilState {
+                depth_stencil_state: Some(vulkan_common::DepthStencilState {
                     depth_test_enable: true,
                     depth_write_enable: true,
                     depth_compare_op: vk::CompareOp::LESS,
-                },
+                }),
                 vertex_attributes: &vulkan_common::create_vertex_attribute_descriptions(
                     0,
                     &[
@@ -1314,12 +1316,10 @@ impl GraphicsPipelines {
             let tonemap_pipeline = vulkan_common::GraphicsPipelineDescriptor {
                 primitive_state: vulkan_common::PrimitiveState {
                     cull_mode: vk::CullModeFlags::NONE,
+                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                    polygon_mode: vk::PolygonMode::FILL
                 },
-                depth_stencil_state: vulkan_common::DepthStencilState {
-                    depth_test_enable: false,
-                    depth_write_enable: false,
-                    depth_compare_op: vk::CompareOp::ALWAYS,
-                },
+                depth_stencil_state: None,
                 vertex_attributes: &[],
                 vertex_bindings: &[],
                 colour_attachments: &[*vk::PipelineColorBlendAttachmentState::builder()
