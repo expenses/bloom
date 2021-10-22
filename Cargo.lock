@@ -2119,6 +2119,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vulkan-bloom"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "bytemuck",
+ "rendering-shaders",
+ "vk-sync",
+]
+
+[[package]]
 name = "vulkan-common"
 version = "0.1.0"
 dependencies = [
@@ -2149,6 +2160,7 @@ dependencies = [
  "simplelog",
  "ultraviolet",
  "vk-sync",
+ "vulkan-bloom",
  "vulkan-common",
  "winit",
 ]

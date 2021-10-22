@@ -9,6 +9,7 @@ use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEve
 use winit::event_loop::ControlFlow;
 use winit::window::Fullscreen;
 use std::mem::ManuallyDrop;
+use vulkan_bloom::{DescriptorSetLayouts, ComputePipelines, BloomTextureWithMips, prefilter_bloom, compute_bloom, bloom_mips_for_dimensions};
 
 // I get 10 mip levels on a 2560 x 1600 display, so 12 is probably enough even for 4k.
 const MAX_MIPS: u32 = 12;
@@ -112,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     let pipeline_cache =
         unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }?;
 
-    let descriptor_set_layouts = DescriptorSetLayouts::new(&device)?;
+    let descriptor_set_layouts = DescriptorSetLayouts::new(&device, MAX_MIPS)?;
     let render_passes = RenderPasses::new(&device, surface_format.format)?;
     let graphics_pipelines = GraphicsPipelines::new(
         &device,
@@ -224,13 +225,13 @@ fn main() -> anyhow::Result<()> {
         )
     }?;
 
-    let bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
+    let mut bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
 
     let mut bloom_texture = BloomTextureWithMips::new(
-        &mut init_resources,
-        extent.width / 2,
-        extent.height / 2,
+        BloomImage::new(extent.width / 2, extent.height / 2, bloom_mips, &mut init_resources)?,
+        &device,
         bloom_mips,
+        MAX_MIPS,
         &descriptor_set_layouts,
         descriptor_pool,
         sampler,
@@ -466,7 +467,7 @@ fn main() -> anyhow::Result<()> {
 
                         hdr_framebuffer.cleanup(&device, &mut allocator)?;
                         depthbuffer.cleanup(&device, &mut allocator)?;
-                        bloom_texture.cleanup(&device, &mut allocator)?;
+                        cleanup_bloom_texture(&bloom_texture, &device, &mut allocator)?;
 
                         let mut init_resources = vulkan_common::InitResources {
                             command_buffer,
@@ -484,13 +485,13 @@ fn main() -> anyhow::Result<()> {
                         depthbuffer =
                             create_depthbuffer(extent.width, extent.height, &mut init_resources)?;
 
-                        let bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
+                        bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
 
                         bloom_texture = BloomTextureWithMips::new_with_existing_sets(
-                            &mut init_resources,
-                            extent.width / 2,
-                            extent.height / 2,
+                            BloomImage::new(extent.width / 2, extent.height / 2, bloom_mips, &mut init_resources)?,
+                            &init_resources.device,
                             bloom_mips,
+                            MAX_MIPS,
                             bloom_texture.storage_mips_descriptor_set,
                             bloom_texture.sampled_texture_descriptor_set,
                         )?;
@@ -789,6 +790,7 @@ fn main() -> anyhow::Result<()> {
                                         &device,
                                         command_buffer,
                                         extent,
+                                        bloom_mips,
                                         &bloom_texture,
                                         &compute_pipelines,
                                         hdr_framebuffer_storage_ds,
@@ -914,7 +916,7 @@ fn main() -> anyhow::Result<()> {
                         depthbuffer.cleanup(&device, &mut allocator)?;
                         vertex_buffer.cleanup(&device, &mut allocator)?;
                         index_buffer.cleanup(&device, &mut allocator)?;
-                        bloom_texture.cleanup(&device, &mut allocator)?;
+                        cleanup_bloom_texture(&bloom_texture, &device, &mut allocator)?;
                     }
 
                     unsafe {
@@ -934,185 +936,6 @@ fn main() -> anyhow::Result<()> {
             log::error!("Error: {}", loop_closure);
         }
     });
-}
-
-unsafe fn prefilter_bloom(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    extent: vk::Extent2D,
-    bloom_texture: &BloomTextureWithMips,
-    filter_constants: FilterConstants,
-    compute_pipelines: &ComputePipelines,
-    input_descriptor_set: vk::DescriptorSet,
-) {
-    device.cmd_bind_pipeline(
-        command_buffer,
-        vk::PipelineBindPoint::COMPUTE,
-        compute_pipelines.downsample_initial,
-    );
-
-    device.cmd_bind_descriptor_sets(
-        command_buffer,
-        vk::PipelineBindPoint::COMPUTE,
-        compute_pipelines.bloom_pipeline_layout,
-        0,
-        &[
-            input_descriptor_set,
-            bloom_texture.storage_mips_descriptor_set,
-        ],
-        &[],
-    );
-
-    device.cmd_push_constants(
-        command_buffer,
-        compute_pipelines.bloom_pipeline_layout,
-        vk::ShaderStageFlags::COMPUTE,
-        0,
-        bytemuck::bytes_of(&filter_constants),
-    );
-
-    device.cmd_dispatch(
-        command_buffer,
-        dispatch_count(extent.width >> 1, 8),
-        dispatch_count(extent.height >> 1, 8),
-        1,
-    );
-}
-
-unsafe fn compute_bloom(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    extent: vk::Extent2D,
-    bloom_texture: &BloomTextureWithMips,
-    compute_pipelines: &ComputePipelines,
-    output_descriptor_set: vk::DescriptorSet,
-) {
-    let bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
-
-    device.cmd_bind_pipeline(
-        command_buffer,
-        vk::PipelineBindPoint::COMPUTE,
-        compute_pipelines.downsample,
-    );
-
-    device.cmd_bind_descriptor_sets(
-        command_buffer,
-        vk::PipelineBindPoint::COMPUTE,
-        compute_pipelines.bloom_pipeline_layout,
-        0,
-        &[bloom_texture.sampled_texture_descriptor_set],
-        &[],
-    );
-
-    for i in 0..bloom_mips - 1 {
-        device.cmd_push_constants(
-            command_buffer,
-            compute_pipelines.bloom_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytemuck::bytes_of(&(i as u32)),
-        );
-        device.cmd_dispatch(
-            command_buffer,
-            dispatch_count(extent.width >> (i + 2), 8),
-            dispatch_count(extent.height >> (i + 2), 8),
-            1,
-        );
-
-        let subresource_range = *vk::ImageSubresourceRange::builder()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1)
-            .base_mip_level(i + 1);
-
-        // Insert an image barrier on the mip that was written to.
-        vk_sync::cmd::pipeline_barrier(
-            &device,
-            command_buffer,
-            None,
-            &[],
-            &[vk_sync::ImageBarrier {
-                previous_accesses: &[vk_sync::AccessType::ComputeShaderWrite],
-                next_accesses: &[
-                    vk_sync::AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer,
-                ],
-                next_layout: vk_sync::ImageLayout::General,
-                image: bloom_texture.image.image,
-                range: subresource_range,
-                ..Default::default()
-            }],
-        );
-    }
-
-    device.cmd_bind_pipeline(
-        command_buffer,
-        vk::PipelineBindPoint::COMPUTE,
-        compute_pipelines.upsample,
-    );
-
-    for i in (0..bloom_mips - 1).rev() {
-        device.cmd_push_constants(
-            command_buffer,
-            compute_pipelines.bloom_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytemuck::bytes_of(&(i as u32)),
-        );
-        device.cmd_dispatch(
-            command_buffer,
-            dispatch_count(extent.width >> (i + 1), 8),
-            dispatch_count(extent.height >> (i + 1), 8),
-            1,
-        );
-
-        let subresource_range = *vk::ImageSubresourceRange::builder()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1)
-            .base_mip_level(i);
-
-        vk_sync::cmd::pipeline_barrier(
-            &device,
-            command_buffer,
-            None,
-            &[],
-            &[vk_sync::ImageBarrier {
-                previous_accesses: &[vk_sync::AccessType::ComputeShaderWrite],
-                next_accesses: &[
-                    vk_sync::AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer,
-                ],
-                next_layout: vk_sync::ImageLayout::General,
-                image: bloom_texture.image.image,
-                range: subresource_range,
-                ..Default::default()
-            }],
-        );
-    }
-
-    device.cmd_bind_pipeline(
-        command_buffer,
-        vk::PipelineBindPoint::COMPUTE,
-        compute_pipelines.upsample_final,
-    );
-
-    device.cmd_bind_descriptor_sets(
-        command_buffer,
-        vk::PipelineBindPoint::COMPUTE,
-        compute_pipelines.upsample_final_pipeline_layout,
-        0,
-        &[
-            bloom_texture.sampled_texture_descriptor_set,
-            output_descriptor_set,
-        ],
-        &[],
-    );
-
-    device.cmd_dispatch(
-        command_buffer,
-        dispatch_count(extent.width, 8),
-        dispatch_count(extent.height, 8),
-        1,
-    );
 }
 
 fn create_swapchain_image_framebuffers(
@@ -1183,67 +1006,11 @@ fn create_depthbuffer(
     )
 }
 
-struct BloomTextureWithMips {
-    image: vulkan_common::Image,
-    views: Vec<vk::ImageView>,
-    storage_mips_descriptor_set: vk::DescriptorSet,
-    sampled_texture_descriptor_set: vk::DescriptorSet,
-}
+struct BloomImage(vulkan_common::Image);
 
-impl BloomTextureWithMips {
-    fn new(
-        init_resources: &mut vulkan_common::InitResources,
-        width: u32,
-        height: u32,
-        mip_levels: u32,
-        descriptor_set_layouts: &DescriptorSetLayouts,
-        descriptor_pool: vk::DescriptorPool,
-        sampler: vk::Sampler,
-    ) -> anyhow::Result<Self> {
-        let descriptor_sets = unsafe {
-            init_resources.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::builder()
-                    .set_layouts(&[
-                        descriptor_set_layouts.bloom_texture,
-                        descriptor_set_layouts.sampled_texture,
-                    ])
-                    .descriptor_pool(descriptor_pool),
-            )
-        }?;
-
-        let storage_mips_descriptor_set = descriptor_sets[0];
-        let sampled_texture_descriptor_set = descriptor_sets[1];
-
-        unsafe {
-            init_resources.device.update_descriptor_sets(
-                &[*vk::WriteDescriptorSet::builder()
-                    .dst_set(sampled_texture_descriptor_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)])],
-                &[],
-            );
-        }
-
-        Self::new_with_existing_sets(
-            init_resources,
-            width,
-            height,
-            mip_levels,
-            storage_mips_descriptor_set,
-            sampled_texture_descriptor_set,
-        )
-    }
-
-    fn new_with_existing_sets(
-        init_resources: &mut vulkan_common::InitResources,
-        width: u32,
-        height: u32,
-        mip_levels: u32,
-        storage_mips_descriptor_set: vk::DescriptorSet,
-        sampled_texture_descriptor_set: vk::DescriptorSet,
-    ) -> anyhow::Result<Self> {
-        let image = vulkan_common::Image::new(
+impl BloomImage {
+    fn new(width: u32, height: u32, mip_levels: u32, init_resources: &mut vulkan_common::InitResources) -> anyhow::Result<Self> {
+         Ok(Self(vulkan_common::Image::new(
             &vulkan_common::ImageDescriptor {
                 width,
                 height,
@@ -1255,83 +1022,23 @@ impl BloomTextureWithMips {
                 next_layout: vk_sync::ImageLayout::Optimal,
             },
             init_resources,
-        )?;
+        )?))
+    }
+}
 
-        let device = init_resources.device;
-
-        let views = (0..mip_levels)
-            .map(|i| {
-                let subresource_range = *vk::ImageSubresourceRange::builder()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1)
-                    .base_mip_level(i);
-
-                unsafe {
-                    device.create_image_view(
-                        &vk::ImageViewCreateInfo::builder()
-                            .image(image.image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(vk::Format::R16G16B16A16_SFLOAT)
-                            .subresource_range(subresource_range),
-                        None,
-                    )
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let dummy_mips = std::iter::repeat(mip_levels - 1).take((MAX_MIPS - mip_levels) as usize);
-
-        let image_infos: Vec<_> = (0..mip_levels)
-            .chain(dummy_mips)
-            .map(|i| {
-                *vk::DescriptorImageInfo::builder()
-                    .image_view(views[i as usize])
-                    .image_layout(vk::ImageLayout::GENERAL)
-            })
-            .collect();
-
-        unsafe {
-            device.update_descriptor_sets(
-                &[
-                    *vk::WriteDescriptorSet::builder()
-                        .dst_set(storage_mips_descriptor_set)
-                        .dst_binding(0)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&image_infos),
-                    *vk::WriteDescriptorSet::builder()
-                        .dst_set(sampled_texture_descriptor_set)
-                        .dst_binding(0)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[*vk::DescriptorImageInfo::builder()
-                            .image_view(image.view)
-                            .image_layout(vk::ImageLayout::GENERAL)]),
-                ],
-                &[],
-            );
-        }
-
-        Ok(Self {
-            image,
-            views,
-            storage_mips_descriptor_set,
-            sampled_texture_descriptor_set,
-        })
+impl vulkan_bloom::Image for BloomImage {
+    fn vk_image(&self) -> vk::Image {
+        self.0.image
     }
 
-    fn cleanup(
-        &self,
-        device: &ash::Device,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
-    ) -> anyhow::Result<()> {
-        for view in &self.views {
-            unsafe {
-                device.destroy_image_view(*view, None);
-            }
-        }
-
-        self.image.cleanup(device, allocator)
+    fn vk_image_view(&self) -> vk::ImageView {
+        self.0.view
     }
+}
+
+fn cleanup_bloom_texture(bloom_texture: &BloomTextureWithMips<BloomImage>, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) -> anyhow::Result<()> {
+    bloom_texture.cleanup_image_views(device);
+    bloom_texture.image.0.cleanup(device, allocator)
 }
 
 #[derive(Default)]
@@ -1582,178 +1289,6 @@ impl GraphicsPipelines {
     }
 }
 
-struct ComputePipelines {
-    downsample_initial: vk::Pipeline,
-    downsample: vk::Pipeline,
-    upsample: vk::Pipeline,
-    upsample_final: vk::Pipeline,
-    upsample_final_pipeline_layout: vk::PipelineLayout,
-    bloom_pipeline_layout: vk::PipelineLayout,
-}
-
-impl ComputePipelines {
-    fn new(
-        device: &ash::Device,
-        descriptor_set_layouts: &DescriptorSetLayouts,
-        pipeline_cache: vk::PipelineCache,
-    ) -> anyhow::Result<Self> {
-        let bloom_pipeline_layout = unsafe {
-            device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::builder()
-                    .set_layouts(&[
-                        descriptor_set_layouts.sampled_texture,
-                        descriptor_set_layouts.bloom_texture,
-                    ])
-                    .push_constant_ranges(&[*vk::PushConstantRange::builder()
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                        .size(128)]),
-                None,
-            )
-        }?;
-
-        let upsample_final_pipeline_layout = unsafe {
-            device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::builder()
-                    .set_layouts(&[
-                        descriptor_set_layouts.sampled_texture,
-                        descriptor_set_layouts.storage_texture,
-                    ])
-                    .push_constant_ranges(&[]),
-                None,
-            )
-        }?;
-
-        let downsample_initial_entry_point = CString::new("downsample_initial")?;
-
-        let downsample_initial_stage = vulkan_common::load_shader_module_as_stage(
-            include_bytes!("../../shaders/downsample_initial.spv"),
-            vk::ShaderStageFlags::COMPUTE,
-            device,
-            &downsample_initial_entry_point,
-        )?;
-
-        let downsample_initial_create_info = vk::ComputePipelineCreateInfo::builder()
-            .stage(*downsample_initial_stage)
-            .layout(bloom_pipeline_layout);
-
-        let downsample_entry_point = CString::new("downsample")?;
-
-        let downsample_stage = vulkan_common::load_shader_module_as_stage(
-            include_bytes!("../../shaders/downsample.spv"),
-            vk::ShaderStageFlags::COMPUTE,
-            device,
-            &downsample_entry_point,
-        )?;
-
-        let downsample_create_info = vk::ComputePipelineCreateInfo::builder()
-            .stage(*downsample_stage)
-            .layout(bloom_pipeline_layout);
-
-        let upsample_entry_point = CString::new("upsample")?;
-
-        let upsample_stage = vulkan_common::load_shader_module_as_stage(
-            include_bytes!("../../shaders/upsample.spv"),
-            vk::ShaderStageFlags::COMPUTE,
-            device,
-            &upsample_entry_point,
-        )?;
-
-        let upsample_create_info = vk::ComputePipelineCreateInfo::builder()
-            .stage(*upsample_stage)
-            .layout(bloom_pipeline_layout);
-
-        let upsample_final_entry_point = CString::new("upsample_final")?;
-
-        let upsample_final_stage = vulkan_common::load_shader_module_as_stage(
-            include_bytes!("../../shaders/upsample_final.spv"),
-            vk::ShaderStageFlags::COMPUTE,
-            device,
-            &upsample_final_entry_point,
-        )?;
-
-        let upsample_final_create_info = vk::ComputePipelineCreateInfo::builder()
-            .stage(*upsample_final_stage)
-            .layout(upsample_final_pipeline_layout);
-
-        let pipelines = unsafe {
-            device.create_compute_pipelines(
-                pipeline_cache,
-                &[
-                    *downsample_initial_create_info,
-                    *downsample_create_info,
-                    *upsample_create_info,
-                    *upsample_final_create_info,
-                ],
-                None,
-            )
-        }
-        .map_err(|(_, err)| err)?;
-
-        Ok(Self {
-            bloom_pipeline_layout,
-            downsample_initial: pipelines[0],
-            downsample: pipelines[1],
-            upsample: pipelines[2],
-            upsample_final: pipelines[3],
-            upsample_final_pipeline_layout,
-        })
-    }
-}
-
-struct DescriptorSetLayouts {
-    sampled_texture: vk::DescriptorSetLayout,
-    bloom_texture: vk::DescriptorSetLayout,
-    storage_texture: vk::DescriptorSetLayout,
-}
-
-impl DescriptorSetLayouts {
-    fn new(device: &ash::Device) -> anyhow::Result<Self> {
-        unsafe {
-            Ok(Self {
-                sampled_texture: device.create_descriptor_set_layout(
-                    &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
-                        *vk::DescriptorSetLayoutBinding::builder()
-                            .binding(0)
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                            .descriptor_count(1)
-                            .stage_flags(
-                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
-                            ),
-                        *vk::DescriptorSetLayoutBinding::builder()
-                            .binding(1)
-                            .descriptor_type(vk::DescriptorType::SAMPLER)
-                            .descriptor_count(1)
-                            .stage_flags(
-                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
-                            ),
-                    ]),
-                    None,
-                )?,
-                bloom_texture: device.create_descriptor_set_layout(
-                    &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
-                        *vk::DescriptorSetLayoutBinding::builder()
-                            .binding(0)
-                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                            .descriptor_count(MAX_MIPS)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                    ]),
-                    None,
-                )?,
-                storage_texture: device.create_descriptor_set_layout(
-                    &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
-                        *vk::DescriptorSetLayoutBinding::builder()
-                            .binding(0)
-                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                    ]),
-                    None,
-                )?,
-            })
-        }
-    }
-}
-
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct Vertex {
@@ -1874,24 +1409,4 @@ fn load_texture_from_gltf(
     buffers_to_cleanup.push(staging_buffer);
 
     Ok(image)
-}
-
-fn bloom_mips_for_dimensions(width: u32, height: u32) -> u32 {
-    let mut mips = 1;
-
-    while (width.min(height) >> (mips + 1)) > 0 {
-        mips += 1;
-    }
-
-    mips
-}
-
-const fn dispatch_count(num: u32, group_size: u32) -> u32 {
-    let mut count = num / group_size;
-    let rem = num % group_size;
-    if rem != 0 {
-        count += 1;
-    }
-
-    count
 }

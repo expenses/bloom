@@ -23,4 +23,4 @@ rendering-shaders = { path = "shaders/rendering" }
 vk-sync = { git = "https://github.com/expenses/vk-sync-rs" }
 
 [workspace]
-members = [".", "compile-shaders", "shaders/rendering", "vulkan-impl", "vulkan-impl/vulkan-common"]
+members = [".", "compile-shaders", "shaders/rendering", "vulkan-impl", "vulkan-impl/vulkan-common", "vulkan-impl/vulkan-bloom"]

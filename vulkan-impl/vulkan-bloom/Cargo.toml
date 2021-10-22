@@ -1,0 +1,13 @@
+[package]
+name = "vulkan-bloom"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.44"
+ash = "0.33.3"
+bytemuck = "1.7.2"
+rendering-shaders = { path = "../../shaders/rendering" }
+vk-sync = { git = "https://github.com/expenses/vk-sync-rs" }
