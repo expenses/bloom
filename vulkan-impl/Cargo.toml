@@ -18,7 +18,7 @@ ash = "0.33.3"
 ash-window = "0.7.0"
 gpu-allocator = "0.10.0"
 simplelog = "0.10.2"
-vulkan-common = { path = "vulkan-common" }
+vulkan-common = { package = "ash-opinionated-abstractions", git = "https://github.com/expenses/ash-opinionated-abstractions" }
 winit = "0.25.0"
 log = "0.4.14"
 vk-sync = { git = "https://github.com/expenses/vk-sync-rs" }

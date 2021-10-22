@@ -97,6 +97,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ash-opinionated-abstractions"
+version = "0.1.0"
+source = "git+https://github.com/expenses/ash-opinionated-abstractions#f3efb249d1b28c92b4deda0d12d16bb367647e51"
+dependencies = [
+ "anyhow",
+ "ash",
+ "gpu-allocator",
+ "log",
+ "vk-sync",
+]
+
+[[package]]
 name = "ash-window"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2130,22 +2142,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "vulkan-common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "gpu-allocator",
- "log",
- "vk-sync",
-]
-
-[[package]]
 name = "vulkan-impl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "ash",
+ "ash-opinionated-abstractions",
  "ash-window",
  "bytemuck",
  "colstodian",
@@ -2161,7 +2163,6 @@ dependencies = [
  "ultraviolet",
  "vk-sync",
  "vulkan-bloom",
- "vulkan-common",
  "winit",
 ]
 
