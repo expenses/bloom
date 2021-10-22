@@ -428,6 +428,7 @@ impl<I: Image> BloomTextureWithMips<I> {
                     .min_filter(vk::Filter::LINEAR)
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .max_lod(vk::LOD_CLAMP_NONE),
                 None,
             )
