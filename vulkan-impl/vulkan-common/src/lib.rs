@@ -3,7 +3,6 @@ use ash::extensions::khr::{Surface as SurfaceLoader, Swapchain as SwapchainLoade
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
 use std::ffi::{CStr, CString};
-use std::ops::Deref;
 use std::os::raw::c_char;
 
 // A list of C strings and their associated pointers
