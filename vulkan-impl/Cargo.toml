@@ -22,3 +22,5 @@ vulkan-common = { path = "vulkan-common" }
 winit = "0.25.0"
 log = "0.4.14"
 vk-sync = { git = "https://github.com/expenses/vk-sync-rs" }
+egui-winit-ash-integration = { git = "https://github.com/expenses/egui-winit-ash-integration", branch = "combined" }
+egui = "0.14.2"

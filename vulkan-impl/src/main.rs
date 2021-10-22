@@ -8,6 +8,7 @@ use vulkan_common::CStrList;
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::ControlFlow;
 use winit::window::Fullscreen;
+use std::mem::ManuallyDrop;
 
 // I get 10 mip levels on a 2560 x 1600 display, so 12 is probably enough even for 4k.
 const MAX_MIPS: u32 = 12;
@@ -394,8 +395,25 @@ fn main() -> anyhow::Result<()> {
         knee: 7.0,
     };
 
+    let allocator = std::sync::Arc::new(std::sync::Mutex::new(allocator));
+
+    let mut egui_integration = ManuallyDrop::new(egui_winit_ash_integration::Integration::new(
+        extent.width,
+        extent.height,
+        window.scale_factor(),
+        Default::default(),
+        Default::default(),
+        device.clone(),
+        allocator.clone(),
+        swapchain_loader.clone(),
+        swapchain.swapchain,
+        surface_format,
+    ));
+
+    let mut allocator = ManuallyDrop::new(allocator);
+
     event_loop.run(move |event, _, control_flow| {
-        //egui_platform.handle_event(&event);
+        egui_integration.handle_event(&event);
 
         let loop_closure = || -> anyhow::Result<()> {
             match event {
@@ -443,6 +461,8 @@ fn main() -> anyhow::Result<()> {
                                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                             )?;
                         }
+
+                        let mut allocator = allocator.lock().unwrap();
 
                         hdr_framebuffer.cleanup(&device, &mut allocator)?;
                         depthbuffer.cleanup(&device, &mut allocator)?;
@@ -531,6 +551,13 @@ fn main() -> anyhow::Result<()> {
                         }?;
 
                         tonemap_framebuffers = create_swapchain_image_framebuffers(&device, extent, &swapchain, &render_passes)?;
+
+                        egui_integration.update_swapchain(
+                            extent.width,
+                            extent.height,
+                            swapchain.swapchain.clone(),
+                            surface_format,
+                        );
                     }
                     WindowEvent::KeyboardInput {
                         input:
@@ -824,6 +851,32 @@ fn main() -> anyhow::Result<()> {
 
                                 device.cmd_end_render_pass(command_buffer);
 
+                                {
+                                    egui_integration.begin_frame();
+
+                                    egui::containers::Window::new("Controls").show(
+                                        &egui_integration.context(),
+                                        |ui| {
+                                            ui.add(
+                                                egui::widgets::Slider::new(
+                                                    &mut filter_constants.threshold,
+                                                    0.0..=10.0,
+                                                )
+                                                .text("Threshold"),
+                                            );
+
+                                            ui.add(
+                                                egui::widgets::Slider::new(&mut filter_constants.knee, 0.0..=10.0)
+                                                    .text("Knee"),
+                                            )
+                                        },
+                                    );
+
+                                    let (_output, paint_commands) = egui_integration.end_frame(&window);
+                                    let paint_jobs = egui_integration.context().tessellate(paint_commands);
+                                    egui_integration.paint(command_buffer, swapchain_image_index as usize, paint_jobs);
+                                }
+
                                 device.end_command_buffer(command_buffer)?;
 
                                 device.queue_submit(
@@ -853,12 +906,23 @@ fn main() -> anyhow::Result<()> {
                         device.queue_wait_idle(queue)?;
                     }
 
-                    texture.cleanup(&device, &mut allocator)?;
-                    hdr_framebuffer.cleanup(&device, &mut allocator)?;
-                    depthbuffer.cleanup(&device, &mut allocator)?;
-                    vertex_buffer.cleanup(&device, &mut allocator)?;
-                    index_buffer.cleanup(&device, &mut allocator)?;
-                    bloom_texture.cleanup(&device, &mut allocator)?;
+                    {
+                        let mut allocator = allocator.lock().unwrap();
+
+                        texture.cleanup(&device, &mut allocator)?;
+                        hdr_framebuffer.cleanup(&device, &mut allocator)?;
+                        depthbuffer.cleanup(&device, &mut allocator)?;
+                        vertex_buffer.cleanup(&device, &mut allocator)?;
+                        index_buffer.cleanup(&device, &mut allocator)?;
+                        bloom_texture.cleanup(&device, &mut allocator)?;
+                    }
+
+                    unsafe {
+                        egui_integration.destroy();
+
+                        ManuallyDrop::drop(&mut allocator);
+                        ManuallyDrop::drop(&mut egui_integration);
+                    }
                 }
                 _ => {}
             }
@@ -961,6 +1025,7 @@ unsafe fn compute_bloom(
             .layer_count(1)
             .base_mip_level(i + 1);
 
+        // Insert an image barrier on the mip that was written to.
         vk_sync::cmd::pipeline_barrier(
             &device,
             command_buffer,
@@ -1339,7 +1404,7 @@ impl RenderPasses {
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
-                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
         ];
 
         let swapchain_framebuffer_ref = [*vk::AttachmentReference::builder()
