@@ -8,6 +8,9 @@ use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEve
 use winit::event_loop::ControlFlow;
 use winit::window::Fullscreen;
 
+// I get 10 mip levels on a 2560 x 1600 display, so 12 is probably enough even for 4k.
+const MAX_MIPS: u32 = 12;
+
 fn main() -> anyhow::Result<()> {
     {
         use simplelog::*;
@@ -105,14 +108,18 @@ fn main() -> anyhow::Result<()> {
     };
 
     let descriptor_set_layouts = DescriptorSetLayouts::new(&device)?;
+    let render_passes = RenderPasses::new(&device, surface_format.format)?;
     let graphics_pipelines =
-        GraphicsPipelines::new(&device, &descriptor_set_layouts, surface_format.format)?;
+        GraphicsPipelines::new(&device, &descriptor_set_layouts, &render_passes)?;
+    let compute_pipelines = ComputePipelines::new(&device, &descriptor_set_layouts)?;
 
     let sampler = unsafe {
         device.create_sampler(
             &vk::SamplerCreateInfo::builder()
                 .mag_filter(vk::Filter::LINEAR)
                 .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                 .max_lod(vk::LOD_CLAMP_NONE),
             None,
         )
@@ -163,6 +170,7 @@ fn main() -> anyhow::Result<()> {
         command_buffer: init_command_buffer,
         device: &device,
         allocator: &mut allocator,
+        debug_utils_loader: Some(&debug_utils_loader),
     };
 
     let (vertex_buffer, index_buffer, num_indices, texture) = load_gltf_from_bytes(
@@ -178,26 +186,44 @@ fn main() -> anyhow::Result<()> {
         height: window_size.height,
     };
 
-    let mut hdr_framebuffer = vulkan_common::Image::new(
-        extent.width,
-        extent.height,
-        "hdr framebuffer",
-        vk::Format::R16G16B16A16_SFLOAT,
-        &mut init_resources,
-        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-        &[vk_sync::AccessType::ColorAttachmentWrite],
-        vk_sync::ImageLayout::Optimal,
-    )?;
+    let mut hdr_framebuffer =
+        create_hdr_framebuffer(extent.width, extent.height, &mut init_resources)?;
 
-    let mut depthbuffer = vulkan_common::Image::new(
-        extent.width,
-        extent.height,
-        "depthbuffer",
-        vk::Format::D32_SFLOAT,
+    let mut depthbuffer = create_depthbuffer(extent.width, extent.height, &mut init_resources)?;
+
+    let sampled_images = 3;
+    let bloom_textures = 1;
+    let storage_textures = 1;
+
+    let descriptor_pool = unsafe {
+        device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::builder()
+                .pool_sizes(&[
+                    *vk::DescriptorPoolSize::builder()
+                        .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_count(sampled_images),
+                    *vk::DescriptorPoolSize::builder()
+                        .ty(vk::DescriptorType::SAMPLER)
+                        .descriptor_count(sampled_images),
+                    *vk::DescriptorPoolSize::builder()
+                        .ty(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(bloom_textures * MAX_MIPS + storage_textures),
+                ])
+                .max_sets(sampled_images + bloom_textures + storage_textures),
+            None,
+        )
+    }?;
+
+    let bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
+
+    let mut bloom_texture = BloomTextureWithMips::new(
         &mut init_resources,
-        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-        &[vk_sync::AccessType::DepthStencilAttachmentWrite],
-        vk_sync::ImageLayout::Optimal,
+        extent.width / 2,
+        extent.height / 2,
+        bloom_mips,
+        &descriptor_set_layouts,
+        descriptor_pool,
+        sampler,
     )?;
 
     drop(init_resources);
@@ -221,28 +247,13 @@ fn main() -> anyhow::Result<()> {
 
     // Bind descriptor sets
 
-    let descriptor_pool = unsafe {
-        device.create_descriptor_pool(
-            &vk::DescriptorPoolCreateInfo::builder()
-                .pool_sizes(&[
-                    *vk::DescriptorPoolSize::builder()
-                        .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                        .descriptor_count(2),
-                    *vk::DescriptorPoolSize::builder()
-                        .ty(vk::DescriptorType::SAMPLER)
-                        .descriptor_count(2),
-                ])
-                .max_sets(2),
-            None,
-        )
-    }?;
-
     let descriptor_sets = unsafe {
         device.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::builder()
                 .set_layouts(&[
                     descriptor_set_layouts.sampled_texture,
                     descriptor_set_layouts.sampled_texture,
+                    descriptor_set_layouts.storage_texture,
                 ])
                 .descriptor_pool(descriptor_pool),
         )
@@ -250,6 +261,7 @@ fn main() -> anyhow::Result<()> {
 
     let descriptor_set = descriptor_sets[0];
     let tonemap_descriptor_set = descriptor_sets[1];
+    let hdr_framebuffer_storage_ds = descriptor_sets[2];
 
     unsafe {
         device.update_descriptor_sets(
@@ -272,12 +284,19 @@ fn main() -> anyhow::Result<()> {
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                     .image_info(&[*vk::DescriptorImageInfo::builder()
                         .image_view(hdr_framebuffer.view)
-                        .image_layout(vk::ImageLayout::GENERAL)]),
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
                 *vk::WriteDescriptorSet::builder()
                     .dst_set(tonemap_descriptor_set)
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)]),
+                *vk::WriteDescriptorSet::builder()
+                    .dst_set(hdr_framebuffer_storage_ds)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&[*vk::DescriptorImageInfo::builder()
+                        .image_view(hdr_framebuffer.view)
+                        .image_layout(vk::ImageLayout::GENERAL)]),
             ],
             &[],
         );
@@ -342,19 +361,38 @@ fn main() -> anyhow::Result<()> {
     let render_semaphore = unsafe { device.create_semaphore(&semaphore_info, None)? };
     let render_fence = unsafe { device.create_fence(&fence_info, None)? };
 
-    let mut swapchain_framebuffers = swapchain
+    let mut draw_framebuffer = {
+        let attachments = [hdr_framebuffer.view, depthbuffer.view];
+
+        unsafe {
+            device.create_framebuffer(
+                &vk::FramebufferCreateInfo::builder()
+                    .render_pass(render_passes.draw)
+                    .attachments(&attachments)
+                    .width(extent.width)
+                    .height(extent.height)
+                    .layers(1),
+                None,
+            )
+        }
+    }?;
+
+    let mut tonemap_framebuffers = swapchain
         .image_views
         .iter()
         .map(|image_view| {
-            let attachments = [*image_view, hdr_framebuffer.view, depthbuffer.view];
-            let framebuffer_info = vk::FramebufferCreateInfo::builder()
-                .render_pass(graphics_pipelines.render_pass)
-                .attachments(&attachments)
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
-
-            unsafe { device.create_framebuffer(&framebuffer_info, None) }
+            let attachments = [*image_view];
+            unsafe {
+                device.create_framebuffer(
+                    &vk::FramebufferCreateInfo::builder()
+                        .render_pass(render_passes.tonemap)
+                        .attachments(&attachments)
+                        .width(extent.width)
+                        .height(extent.height)
+                        .layers(1),
+                    None,
+                )
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -393,9 +431,6 @@ fn main() -> anyhow::Result<()> {
                             swapchain_info,
                         )?;
 
-                        hdr_framebuffer.cleanup(&device, &mut allocator)?;
-                        depthbuffer.cleanup(&device, &mut allocator)?;
-
                         unsafe {
                             device.reset_command_pool(
                                 command_pool,
@@ -411,32 +446,35 @@ fn main() -> anyhow::Result<()> {
                             )?;
                         }
 
+                        hdr_framebuffer.cleanup(&device, &mut allocator)?;
+                        depthbuffer.cleanup(&device, &mut allocator)?;
+                        bloom_texture.cleanup(&device, &mut allocator)?;
+
                         let mut init_resources = vulkan_common::InitResources {
                             command_buffer,
                             device: &device,
                             allocator: &mut allocator,
+                            debug_utils_loader: Some(&debug_utils_loader),
                         };
 
-                        hdr_framebuffer = vulkan_common::Image::new(
+                        hdr_framebuffer = create_hdr_framebuffer(
                             extent.width,
                             extent.height,
-                            "hdr framebuffer",
-                            vk::Format::R16G16B16A16_SFLOAT,
                             &mut init_resources,
-                            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                            &[vk_sync::AccessType::ColorAttachmentWrite],
-                            vk_sync::ImageLayout::Optimal,
                         )?;
 
-                        depthbuffer = vulkan_common::Image::new(
-                            extent.width,
-                            extent.height,
-                            "depth",
-                            vk::Format::D32_SFLOAT,
+                        depthbuffer =
+                            create_depthbuffer(extent.width, extent.height, &mut init_resources)?;
+
+                        let bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
+
+                        bloom_texture = BloomTextureWithMips::new_with_existing_sets(
                             &mut init_resources,
-                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                            &[vk_sync::AccessType::DepthStencilAttachmentWrite],
-                            vk_sync::ImageLayout::Optimal,
+                            extent.width / 2,
+                            extent.height / 2,
+                            9,
+                            bloom_texture.storage_mips_descriptor_set,
+                            bloom_texture.sampled_texture_descriptor_set,
                         )?;
 
                         drop(init_resources);
@@ -462,25 +500,51 @@ fn main() -> anyhow::Result<()> {
                                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                                     .image_info(&[*vk::DescriptorImageInfo::builder()
                                         .image_view(hdr_framebuffer.view)
-                                        .image_layout(vk::ImageLayout::GENERAL)])],
+                                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
+                                    *vk::WriteDescriptorSet::builder()
+                                        .dst_set(hdr_framebuffer_storage_ds)
+                                        .dst_binding(0)
+                                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                                        .image_info(&[*vk::DescriptorImageInfo::builder()
+                                            .image_view(hdr_framebuffer.view)
+                                            .image_layout(vk::ImageLayout::GENERAL)]),
+                                ],
                                 &[],
                             );
                         }
 
-                        swapchain_framebuffers = swapchain
+                        draw_framebuffer = {
+                            let attachments = [hdr_framebuffer.view, depthbuffer.view];
+
+                            unsafe {
+                                device.create_framebuffer(
+                                    &vk::FramebufferCreateInfo::builder()
+                                        .render_pass(render_passes.draw)
+                                        .attachments(&attachments)
+                                        .width(extent.width)
+                                        .height(extent.height)
+                                        .layers(1),
+                                    None,
+                                )
+                            }
+                        }?;
+
+                        tonemap_framebuffers = swapchain
                             .image_views
                             .iter()
                             .map(|image_view| {
-                                let attachments =
-                                    [*image_view, hdr_framebuffer.view, depthbuffer.view];
-                                let framebuffer_info = vk::FramebufferCreateInfo::builder()
-                                    .render_pass(graphics_pipelines.render_pass)
-                                    .attachments(&attachments)
-                                    .width(extent.width)
-                                    .height(extent.height)
-                                    .layers(1);
-
-                                unsafe { device.create_framebuffer(&framebuffer_info, None) }
+                                let attachments = [*image_view];
+                                unsafe {
+                                    device.create_framebuffer(
+                                        &vk::FramebufferCreateInfo::builder()
+                                            .render_pass(render_passes.tonemap)
+                                            .attachments(&attachments)
+                                            .width(extent.width)
+                                            .height(extent.height)
+                                            .layers(1),
+                                        None,
+                                    )
+                                }
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                     }
@@ -579,15 +643,7 @@ fn main() -> anyhow::Result<()> {
                         )
                     } {
                         Ok((swapchain_image_index, _suboptimal)) => {
-                            let swapchain_framebuffer =
-                                swapchain_framebuffers[swapchain_image_index as usize];
-
-                            let clear_values = [
-                                vk::ClearValue {
-                                    color: vk::ClearColorValue {
-                                        float32: [0.0, 0.0, 0.0, 1.0],
-                                    },
-                                },
+                            let draw_clear_values = [
                                 vk::ClearValue {
                                     color: vk::ClearColorValue {
                                         float32: [0.0, 0.0, 0.0, 1.0],
@@ -600,15 +656,27 @@ fn main() -> anyhow::Result<()> {
                                     },
                                 },
                             ];
+                            let tonemap_clear_values = [vk::ClearValue {
+                                color: vk::ClearColorValue {
+                                    float32: [0.0, 0.0, 0.0, 1.0],
+                                },
+                            }];
                             let area = vk::Rect2D {
                                 offset: vk::Offset2D { x: 0, y: 0 },
                                 extent,
                             };
-                            let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
-                                .render_pass(graphics_pipelines.render_pass)
-                                .framebuffer(swapchain_framebuffer)
+
+                            let draw_render_pass_info = vk::RenderPassBeginInfo::builder()
+                                .render_pass(render_passes.draw)
+                                .framebuffer(draw_framebuffer)
                                 .render_area(area)
-                                .clear_values(&clear_values);
+                                .clear_values(&draw_clear_values);
+
+                            let tonemap_render_pass_info = vk::RenderPassBeginInfo::builder()
+                                .render_pass(render_passes.tonemap)
+                                .framebuffer(tonemap_framebuffers[swapchain_image_index as usize])
+                                .render_area(area)
+                                .clear_values(&tonemap_clear_values);
 
                             let viewport = *vk::Viewport::builder()
                                 .x(0.0)
@@ -636,7 +704,7 @@ fn main() -> anyhow::Result<()> {
 
                                 device.cmd_begin_render_pass(
                                     command_buffer,
-                                    &render_pass_begin_info,
+                                    &draw_render_pass_info,
                                     vk::SubpassContents::INLINE,
                                 );
 
@@ -679,8 +747,202 @@ fn main() -> anyhow::Result<()> {
 
                                 device.cmd_draw_indexed(command_buffer, num_indices, 1, 0, 0, 0);
 
-                                device
-                                    .cmd_next_subpass(command_buffer, vk::SubpassContents::INLINE);
+                                device.cmd_end_render_pass(command_buffer);
+
+                                {
+                                    let bloom_mips =
+                                        bloom_mips_for_dimensions(extent.width, extent.height);
+
+                                    device.cmd_bind_pipeline(
+                                        command_buffer,
+                                        vk::PipelineBindPoint::COMPUTE,
+                                        compute_pipelines.downsample_initial,
+                                    );
+
+                                    device.cmd_bind_descriptor_sets(
+                                        command_buffer,
+                                        vk::PipelineBindPoint::COMPUTE,
+                                        compute_pipelines.bloom_pipeline_layout,
+                                        0,
+                                        &[
+                                            tonemap_descriptor_set,
+                                            bloom_texture.storage_mips_descriptor_set,
+                                        ],
+                                        &[],
+                                    );
+
+                                    device.cmd_push_constants(
+                                        command_buffer,
+                                        compute_pipelines.bloom_pipeline_layout,
+                                        vk::ShaderStageFlags::COMPUTE,
+                                        0,
+                                        bytemuck::bytes_of(&rendering_shaders::FilterConstants {
+                                            threshold: 7.0,
+                                            knee: 7.0,
+                                        }),
+                                    );
+
+                                    device.cmd_dispatch(
+                                        command_buffer,
+                                        dispatch_count(extent.width >> 1, 8),
+                                        dispatch_count(extent.height >> 1, 8),
+                                        1,
+                                    );
+
+                                    device.cmd_bind_pipeline(
+                                        command_buffer,
+                                        vk::PipelineBindPoint::COMPUTE,
+                                        compute_pipelines.downsample,
+                                    );
+
+                                    device.cmd_bind_descriptor_sets(
+                                        command_buffer,
+                                        vk::PipelineBindPoint::COMPUTE,
+                                        compute_pipelines.bloom_pipeline_layout,
+                                        0,
+                                        &[bloom_texture.sampled_texture_descriptor_set],
+                                        &[],
+                                    );
+
+                                    for i in 0..bloom_mips - 1 {
+                                        device.cmd_push_constants(
+                                            command_buffer,
+                                            compute_pipelines.bloom_pipeline_layout,
+                                            vk::ShaderStageFlags::COMPUTE,
+                                            0,
+                                            bytemuck::bytes_of(&(i as u32)),
+                                        );
+                                        device.cmd_dispatch(
+                                            command_buffer,
+                                            dispatch_count(extent.width >> (i + 2), 8),
+                                            dispatch_count(extent.height >> (i + 2), 8),
+                                            1,
+                                        );
+
+                                        let subresource_range = *vk::ImageSubresourceRange::builder()
+                                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                            .level_count(1)
+                                            .layer_count(1)
+                                            .base_mip_level(i + 1);
+
+                                        vk_sync::cmd::pipeline_barrier(
+                                            &device,
+                                            command_buffer,
+                                            None,
+                                            &[],
+                                            &[vk_sync::ImageBarrier {
+                                                previous_accesses: &[vk_sync::AccessType::ComputeShaderWrite],
+                                                next_accesses: &[vk_sync::AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer],
+                                                next_layout: vk_sync::ImageLayout::General,
+                                                image: bloom_texture.image.image,
+                                                range: subresource_range,
+                                                ..Default::default()
+                                            }],
+                                        );
+                                    }
+
+                                    device.cmd_bind_pipeline(
+                                        command_buffer,
+                                        vk::PipelineBindPoint::COMPUTE,
+                                        compute_pipelines.upsample,
+                                    );
+
+                                    for i in (0 .. bloom_mips - 1).rev() {
+                                        device.cmd_push_constants(
+                                            command_buffer,
+                                            compute_pipelines.bloom_pipeline_layout,
+                                            vk::ShaderStageFlags::COMPUTE,
+                                            0,
+                                            bytemuck::bytes_of(&(i as u32)),
+                                        );
+                                        device.cmd_dispatch(
+                                            command_buffer,
+                                            dispatch_count(extent.width >> (i + 1), 8),
+                                            dispatch_count(extent.height >> (i + 1), 8),
+                                            1,
+                                        );
+
+                                        let subresource_range = *vk::ImageSubresourceRange::builder()
+                                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                            .level_count(1)
+                                            .layer_count(1)
+                                            .base_mip_level(i);
+
+                                        vk_sync::cmd::pipeline_barrier(
+                                            &device,
+                                            command_buffer,
+                                            None,
+                                            &[],
+                                            &[vk_sync::ImageBarrier {
+                                                previous_accesses: &[vk_sync::AccessType::ComputeShaderWrite],
+                                                next_accesses: &[vk_sync::AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer],
+                                                next_layout: vk_sync::ImageLayout::General,
+                                                image: bloom_texture.image.image,
+                                                range: subresource_range,
+                                                ..Default::default()
+                                            }],
+                                        );
+                                    }
+
+                                    let subresource_range = *vk::ImageSubresourceRange::builder()
+                                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                            .level_count(1)
+                                            .layer_count(1);
+
+                                    vk_sync::cmd::pipeline_barrier(
+                                        &device,
+                                        command_buffer,
+                                        None,
+                                        &[],
+                                        &[vk_sync::ImageBarrier {
+                                            previous_accesses: &[vk_sync::AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer],
+                                            next_accesses: &[vk_sync::AccessType::ComputeShaderWrite],
+                                            next_layout: vk_sync::ImageLayout::General,
+                                            image: hdr_framebuffer.image,
+                                            range: subresource_range,
+                                            ..Default::default()
+                                        }],
+                                    );
+
+                                    device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, compute_pipelines.upsample_final);
+
+                                    device.cmd_bind_descriptor_sets(
+                                        command_buffer,
+                                        vk::PipelineBindPoint::COMPUTE,
+                                        compute_pipelines.upsample_final_pipeline_layout,
+                                        0,
+                                        &[bloom_texture.sampled_texture_descriptor_set, hdr_framebuffer_storage_ds],
+                                        &[],
+                                    );
+
+                                    device.cmd_dispatch(
+                                            command_buffer,
+                                            dispatch_count(extent.width, 8),
+                                            dispatch_count(extent.height, 8),
+                                            1,
+                                        );
+
+                                    vk_sync::cmd::pipeline_barrier(
+                                        &device,
+                                        command_buffer,
+                                        None,
+                                        &[],
+                                        &[vk_sync::ImageBarrier {
+                                            previous_accesses: &[vk_sync::AccessType::ComputeShaderWrite],
+                                            next_accesses: &[vk_sync::AccessType::FragmentShaderReadSampledImageOrUniformTexelBuffer],
+                                            next_layout: vk_sync::ImageLayout::Optimal,
+                                            image: hdr_framebuffer.image,
+                                            range: subresource_range,
+                                            ..Default::default()
+                                        }],
+                                    );
+                                }
+
+                                device.cmd_begin_render_pass(
+                                    command_buffer,
+                                    &tonemap_render_pass_info,
+                                    vk::SubpassContents::INLINE,
+                                );
 
                                 device.cmd_bind_pipeline(
                                     command_buffer,
@@ -749,6 +1011,7 @@ fn main() -> anyhow::Result<()> {
                     depthbuffer.cleanup(&device, &mut allocator)?;
                     vertex_buffer.cleanup(&device, &mut allocator)?;
                     index_buffer.cleanup(&device, &mut allocator)?;
+                    bloom_texture.cleanup(&device, &mut allocator)?;
                 }
                 _ => {}
             }
@@ -762,6 +1025,199 @@ fn main() -> anyhow::Result<()> {
     });
 }
 
+fn create_hdr_framebuffer(
+    width: u32,
+    height: u32,
+    init_resources: &mut vulkan_common::InitResources,
+) -> anyhow::Result<vulkan_common::Image> {
+    vulkan_common::Image::new(
+        &vulkan_common::ImageDescriptor {
+            width,
+            height,
+            name: "hdr framebuffer",
+            mip_levels: 1,
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::STORAGE,
+            next_accesses: &[vk_sync::AccessType::ColorAttachmentWrite],
+            next_layout: vk_sync::ImageLayout::Optimal,
+        },
+        init_resources,
+    )
+}
+
+fn create_depthbuffer(
+    width: u32,
+    height: u32,
+    init_resources: &mut vulkan_common::InitResources,
+) -> anyhow::Result<vulkan_common::Image> {
+    vulkan_common::Image::new(
+        &vulkan_common::ImageDescriptor {
+            width,
+            height,
+            name: "depth",
+            mip_levels: 1,
+            format: vk::Format::D32_SFLOAT,
+            usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            next_accesses: &[vk_sync::AccessType::DepthStencilAttachmentWrite],
+            next_layout: vk_sync::ImageLayout::Optimal,
+        },
+        init_resources,
+    )
+}
+
+struct BloomTextureWithMips {
+    image: vulkan_common::Image,
+    views: Vec<vk::ImageView>,
+    storage_mips_descriptor_set: vk::DescriptorSet,
+    sampled_texture_descriptor_set: vk::DescriptorSet,
+}
+
+impl BloomTextureWithMips {
+    fn new(
+        init_resources: &mut vulkan_common::InitResources,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        descriptor_set_layouts: &DescriptorSetLayouts,
+        descriptor_pool: vk::DescriptorPool,
+        sampler: vk::Sampler,
+    ) -> anyhow::Result<Self> {
+        let descriptor_sets = unsafe {
+            init_resources.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::builder()
+                    .set_layouts(&[
+                        descriptor_set_layouts.bloom_texture,
+                        descriptor_set_layouts.sampled_texture,
+                    ])
+                    .descriptor_pool(descriptor_pool),
+            )
+        }?;
+
+        let storage_mips_descriptor_set = descriptor_sets[0];
+        let sampled_texture_descriptor_set = descriptor_sets[1];
+
+        unsafe {
+            init_resources.device.update_descriptor_sets(
+                &[*vk::WriteDescriptorSet::builder()
+                    .dst_set(sampled_texture_descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)])],
+                &[],
+            );
+        }
+
+        Self::new_with_existing_sets(
+            init_resources,
+            width,
+            height,
+            mip_levels,
+            storage_mips_descriptor_set,
+            sampled_texture_descriptor_set,
+        )
+    }
+
+    fn new_with_existing_sets(
+        init_resources: &mut vulkan_common::InitResources,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        storage_mips_descriptor_set: vk::DescriptorSet,
+        sampled_texture_descriptor_set: vk::DescriptorSet,
+    ) -> anyhow::Result<Self> {
+        let image = vulkan_common::Image::new(
+            &vulkan_common::ImageDescriptor {
+                width,
+                height,
+                name: "bloom texture",
+                mip_levels,
+                format: vk::Format::R16G16B16A16_SFLOAT,
+                usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+                next_accesses: &[vk_sync::AccessType::ComputeShaderWrite],
+                next_layout: vk_sync::ImageLayout::Optimal,
+            },
+            init_resources,
+        )?;
+
+        let device = init_resources.device;
+
+        let views = (0..mip_levels)
+            .map(|i| {
+                let subresource_range = *vk::ImageSubresourceRange::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1)
+                    .base_mip_level(i);
+
+                unsafe {
+                    device.create_image_view(
+                        &vk::ImageViewCreateInfo::builder()
+                            .image(image.image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(vk::Format::R16G16B16A16_SFLOAT)
+                            .subresource_range(subresource_range),
+                        None,
+                    )
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let dummy_mips = std::iter::repeat(mip_levels - 1).take((MAX_MIPS - mip_levels) as usize);
+
+        let image_infos: Vec<_> = (0..mip_levels)
+            .chain(dummy_mips)
+            .map(|i| {
+                *vk::DescriptorImageInfo::builder()
+                    .image_view(views[i as usize])
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect();
+
+        unsafe {
+            device.update_descriptor_sets(
+                &[
+                    *vk::WriteDescriptorSet::builder()
+                        .dst_set(storage_mips_descriptor_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&image_infos),
+                    *vk::WriteDescriptorSet::builder()
+                        .dst_set(sampled_texture_descriptor_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&[*vk::DescriptorImageInfo::builder()
+                            .image_view(image.view)
+                            .image_layout(vk::ImageLayout::GENERAL)]),
+                ],
+                &[],
+            );
+        }
+
+        Ok(Self {
+            image,
+            views,
+            storage_mips_descriptor_set,
+            sampled_texture_descriptor_set,
+        })
+    }
+
+    fn cleanup(
+        &self,
+        device: &ash::Device,
+        allocator: &mut gpu_allocator::vulkan::Allocator,
+    ) -> anyhow::Result<()> {
+        for view in &self.views {
+            unsafe {
+                device.destroy_image_view(*view, None);
+            }
+        }
+
+        self.image.cleanup(device, allocator)
+    }
+}
+
 #[derive(Default)]
 struct KeyboardState {
     forwards: bool,
@@ -770,8 +1226,105 @@ struct KeyboardState {
     left: bool,
 }
 
+struct RenderPasses {
+    draw: vk::RenderPass,
+    tonemap: vk::RenderPass,
+}
+
+impl RenderPasses {
+    fn new(device: &ash::Device, surface_format: vk::Format) -> anyhow::Result<Self> {
+        let draw_attachments = [
+            // HDR framebuffer
+            *vk::AttachmentDescription::builder()
+                .format(vk::Format::R16G16B16A16_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            // Depth buffer
+            *vk::AttachmentDescription::builder()
+                .format(vk::Format::D32_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        ];
+
+        let hdr_framebuffer_ref = [*vk::AttachmentReference::builder()
+            .attachment(0)
+            .layout(vk::ImageLayout::GENERAL)];
+
+        let depth_attachment_ref = *vk::AttachmentReference::builder()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let draw_subpass = [*vk::SubpassDescription::builder()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&hdr_framebuffer_ref)
+            .depth_stencil_attachment(&depth_attachment_ref)];
+
+        let draw_subpass_dependency = [*vk::SubpassDependency::builder()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+
+        let draw_render_pass = unsafe {
+            device.create_render_pass(
+                &vk::RenderPassCreateInfo::builder()
+                    .attachments(&draw_attachments)
+                    .subpasses(&draw_subpass)
+                    .dependencies(&draw_subpass_dependency),
+                None,
+            )
+        }?;
+
+        let tonemap_attachments = [
+            // Swapchain framebuffer
+            *vk::AttachmentDescription::builder()
+                .format(surface_format)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+        ];
+
+        let swapchain_framebuffer_ref = [*vk::AttachmentReference::builder()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+
+        let tonemap_subpass = [*vk::SubpassDescription::builder()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&swapchain_framebuffer_ref)];
+
+        let tonemap_subpass_dependency = [*vk::SubpassDependency::builder()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+
+        let tonemap_render_pass = unsafe {
+            device.create_render_pass(
+                &vk::RenderPassCreateInfo::builder()
+                    .attachments(&tonemap_attachments)
+                    .subpasses(&tonemap_subpass)
+                    .dependencies(&tonemap_subpass_dependency),
+                None,
+            )
+        }?;
+
+        Ok(Self {
+            draw: draw_render_pass,
+            tonemap: tonemap_render_pass,
+        })
+    }
+}
+
 struct GraphicsPipelines {
-    render_pass: vk::RenderPass,
     graphics_pipeline: vk::Pipeline,
     tonemap_pipeline: vk::Pipeline,
     general_pipeline_layout: vk::PipelineLayout,
@@ -781,84 +1334,9 @@ impl GraphicsPipelines {
     fn new(
         device: &ash::Device,
         descriptor_set_layouts: &DescriptorSetLayouts,
-        surface_format: vk::Format,
+        render_passes: &RenderPasses,
     ) -> anyhow::Result<Self> {
         use vulkan_common::load_shader_module_as_stage;
-
-        let render_pass = {
-            let attachments = [
-                // Swapchain framebuffer
-                *vk::AttachmentDescription::builder()
-                    .format(surface_format)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-                // HDR framebuffer
-                *vk::AttachmentDescription::builder()
-                    .format(vk::Format::R16G16B16A16_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                // Depth buffer
-                *vk::AttachmentDescription::builder()
-                    .format(vk::Format::D32_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
-            ];
-
-            let swapchain_framebuffer_ref = [*vk::AttachmentReference::builder()
-                .attachment(0)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-
-            let color_attachment_refs = [*vk::AttachmentReference::builder()
-                .attachment(1)
-                .layout(vk::ImageLayout::GENERAL)];
-
-            let depth_attachment_ref = *vk::AttachmentReference::builder()
-                .attachment(2)
-                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-
-            let subpasses = [
-                *vk::SubpassDescription::builder()
-                    .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(&color_attachment_refs)
-                    .depth_stencil_attachment(&depth_attachment_ref),
-                *vk::SubpassDescription::builder()
-                    .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(&swapchain_framebuffer_ref),
-            ];
-
-            let subpass_dependencies = [
-                *vk::SubpassDependency::builder()
-                    .src_subpass(vk::SUBPASS_EXTERNAL)
-                    .dst_subpass(0)
-                    .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                *vk::SubpassDependency::builder()
-                    .src_subpass(0)
-                    .dst_subpass(1)
-                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ)
-                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-            ];
-
-            unsafe {
-                device.create_render_pass(
-                    &vk::RenderPassCreateInfo::builder()
-                        .attachments(&attachments)
-                        .subpasses(&subpasses)
-                        .dependencies(&subpass_dependencies),
-                    None,
-                )
-            }?
-        };
 
         let vertex_entry_point = CString::new("vertex")?;
 
@@ -936,8 +1414,12 @@ impl GraphicsPipelines {
 
             let baked = graphics_pipeline_desc.as_baked();
 
-            let graphics_pipeline_desc =
-                baked.as_pipeline_create_info(stages, general_pipeline_layout, render_pass, 0);
+            let graphics_pipeline_desc = baked.as_pipeline_create_info(
+                stages,
+                general_pipeline_layout,
+                render_passes.draw,
+                0,
+            );
 
             let tonemap_pipeline = vulkan_common::GraphicsPipelineDescriptor {
                 primitive_state: vulkan_common::PrimitiveState {
@@ -961,8 +1443,8 @@ impl GraphicsPipelines {
             let tonemap_desc = tonemap_baked.as_pipeline_create_info(
                 tonemap_stages,
                 general_pipeline_layout,
-                render_pass,
-                1,
+                render_passes.tonemap,
+                0,
             );
 
             unsafe {
@@ -976,7 +1458,6 @@ impl GraphicsPipelines {
         };
 
         Ok(Self {
-            render_pass,
             graphics_pipeline: pipelines[0],
             tonemap_pipeline: pipelines[1],
             general_pipeline_layout,
@@ -984,8 +1465,127 @@ impl GraphicsPipelines {
     }
 }
 
+struct ComputePipelines {
+    downsample_initial: vk::Pipeline,
+    downsample: vk::Pipeline,
+    upsample: vk::Pipeline,
+    upsample_final: vk::Pipeline,
+    upsample_final_pipeline_layout: vk::PipelineLayout,
+    bloom_pipeline_layout: vk::PipelineLayout,
+}
+
+impl ComputePipelines {
+    fn new(
+        device: &ash::Device,
+        descriptor_set_layouts: &DescriptorSetLayouts,
+    ) -> anyhow::Result<Self> {
+        let bloom_pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::builder()
+                    .set_layouts(&[
+                        descriptor_set_layouts.sampled_texture,
+                        descriptor_set_layouts.bloom_texture,
+                    ])
+                    .push_constant_ranges(&[*vk::PushConstantRange::builder()
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .size(128)]),
+                None,
+            )
+        }?;
+
+        let upsample_final_pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::builder()
+                    .set_layouts(&[
+                        descriptor_set_layouts.sampled_texture,
+                        descriptor_set_layouts.storage_texture,
+                    ])
+                    .push_constant_ranges(&[]),
+                None,
+            )
+        }?;
+
+        let downsample_initial_entry_point = CString::new("downsample_initial")?;
+
+        let downsample_initial_stage = vulkan_common::load_shader_module_as_stage(
+            include_bytes!("../../shaders/downsample_initial.spv"),
+            vk::ShaderStageFlags::COMPUTE,
+            device,
+            &downsample_initial_entry_point,
+        )?;
+
+        let downsample_initial_create_info = vk::ComputePipelineCreateInfo::builder()
+            .stage(*downsample_initial_stage)
+            .layout(bloom_pipeline_layout);
+
+        let downsample_entry_point = CString::new("downsample")?;
+
+        let downsample_stage = vulkan_common::load_shader_module_as_stage(
+            include_bytes!("../../shaders/downsample.spv"),
+            vk::ShaderStageFlags::COMPUTE,
+            device,
+            &downsample_entry_point,
+        )?;
+
+        let downsample_create_info = vk::ComputePipelineCreateInfo::builder()
+            .stage(*downsample_stage)
+            .layout(bloom_pipeline_layout);
+
+        let upsample_entry_point = CString::new("upsample")?;
+
+        let upsample_stage = vulkan_common::load_shader_module_as_stage(
+            include_bytes!("../../shaders/upsample.spv"),
+            vk::ShaderStageFlags::COMPUTE,
+            device,
+            &upsample_entry_point,
+        )?;
+
+        let upsample_create_info = vk::ComputePipelineCreateInfo::builder()
+            .stage(*upsample_stage)
+            .layout(bloom_pipeline_layout);
+
+        let upsample_final_entry_point = CString::new("upsample_final")?;
+
+        let upsample_final_stage = vulkan_common::load_shader_module_as_stage(
+            include_bytes!("../../shaders/upsample_final.spv"),
+            vk::ShaderStageFlags::COMPUTE,
+            device,
+            &upsample_final_entry_point,
+        )?;
+
+        let upsample_final_create_info = vk::ComputePipelineCreateInfo::builder()
+            .stage(*upsample_final_stage)
+            .layout(upsample_final_pipeline_layout);
+
+        let pipelines = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[
+                    *downsample_initial_create_info,
+                    *downsample_create_info,
+                    *upsample_create_info,
+                    *upsample_final_create_info,
+                ],
+                None,
+            )
+        }
+        .map_err(|(_, err)| err)?;
+
+        Ok(Self {
+            bloom_pipeline_layout,
+            downsample_initial: pipelines[0],
+            downsample: pipelines[1],
+            upsample: pipelines[2],
+            upsample_final: pipelines[3],
+            upsample_final_pipeline_layout,
+        })
+    }
+}
+
 struct DescriptorSetLayouts {
     sampled_texture: vk::DescriptorSetLayout,
+    bloom_texture: vk::DescriptorSetLayout,
+    storage_texture: vk::DescriptorSetLayout,
 }
 
 impl DescriptorSetLayouts {
@@ -998,12 +1598,36 @@ impl DescriptorSetLayouts {
                             .binding(0)
                             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                             .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                            .stage_flags(
+                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
+                            ),
                         *vk::DescriptorSetLayoutBinding::builder()
                             .binding(1)
                             .descriptor_type(vk::DescriptorType::SAMPLER)
                             .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                            .stage_flags(
+                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
+                            ),
+                    ]),
+                    None,
+                )?,
+                bloom_texture: device.create_descriptor_set_layout(
+                    &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
+                        *vk::DescriptorSetLayoutBinding::builder()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .descriptor_count(MAX_MIPS)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    ]),
+                    None,
+                )?,
+                storage_texture: device.create_descriptor_set_layout(
+                    &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
+                        *vk::DescriptorSetLayoutBinding::builder()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
                     ]),
                     None,
                 )?,
@@ -1132,4 +1756,24 @@ fn load_texture_from_gltf(
     buffers_to_cleanup.push(staging_buffer);
 
     Ok(image)
+}
+
+fn bloom_mips_for_dimensions(width: u32, height: u32) -> u32 {
+    let mut mips = 1;
+
+    while (width.min(height) >> (mips + 1)) > 0 {
+        mips += 1;
+    }
+
+    mips
+}
+
+const fn dispatch_count(num: u32, group_size: u32) -> u32 {
+    let mut count = num / group_size;
+    let rem = num % group_size;
+    if rem != 0 {
+        count += 1;
+    }
+
+    count
 }

@@ -1,7 +1,8 @@
+use ash::extensions::ext::DebugUtils as DebugUtilsLoader;
 use ash::extensions::khr::{Surface as SurfaceLoader, Swapchain as SwapchainLoader};
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::ops::Deref;
 use std::os::raw::c_char;
 
@@ -353,10 +354,32 @@ impl<'a> BakedGraphicsPipelineDescriptor<'a> {
     }
 }
 
+pub fn set_object_name<T: vk::Handle>(
+    device: &ash::Device,
+    debug_utils_loader: &DebugUtilsLoader,
+    handle: T,
+    name: &str,
+) -> anyhow::Result<()> {
+    let name = CString::new(name)?;
+
+    unsafe {
+        debug_utils_loader.debug_utils_set_object_name(
+            device.handle(),
+            &*vk::DebugUtilsObjectNameInfoEXT::builder()
+                .object_type(T::TYPE)
+                .object_handle(handle.as_raw())
+                .object_name(&name),
+        )?;
+    }
+
+    Ok(())
+}
+
 pub struct InitResources<'a> {
     pub command_buffer: vk::CommandBuffer,
     pub device: &'a ash::Device,
     pub allocator: &'a mut Allocator,
+    pub debug_utils_loader: Option<&'a DebugUtilsLoader>,
 }
 
 pub fn create_image_from_bytes(
@@ -415,8 +438,10 @@ pub fn create_image_from_bytes(
         init_resources
             .device
             .bind_image_memory(image, allocation.memory(), allocation.offset())?;
+    }
 
-        //allocator.device.set_object_name(image, name)?;
+    if let Some(debug_utils_loader) = init_resources.debug_utils_loader {
+        set_object_name(&init_resources.device, debug_utils_loader, image, name)?;
     }
 
     let subresource_range = *vk::ImageSubresourceRange::builder()
@@ -488,8 +513,8 @@ pub fn create_image_from_bytes(
     Ok((
         Image {
             image,
-            view,
             allocation,
+            view,
         },
         staging_buffer,
     ))
@@ -527,7 +552,7 @@ impl Buffer {
             linear: true,
         })?;
 
-        Self::from_parts(allocation, buffer, bytes, name, init_resources.device)
+        Self::from_parts(allocation, buffer, bytes, name, init_resources)
     }
 
     fn from_parts(
@@ -535,17 +560,23 @@ impl Buffer {
         buffer: vk::Buffer,
         bytes: &[u8],
         name: &str,
-        device: &ash::Device,
+        init_resources: &InitResources,
     ) -> anyhow::Result<Self> {
         let slice = allocation.mapped_slice_mut().unwrap();
 
         slice[..bytes.len()].copy_from_slice(bytes);
 
         unsafe {
-            device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
-
-            //device.set_object_name(buffer, name)?;
+            init_resources.device.bind_buffer_memory(
+                buffer,
+                allocation.memory(),
+                allocation.offset(),
+            )?;
         };
+
+        if let Some(debug_utils_loader) = init_resources.debug_utils_loader {
+            set_object_name(&init_resources.device, debug_utils_loader, buffer, name)?;
+        }
 
         Ok(Self { buffer, allocation })
     }
@@ -570,6 +601,17 @@ impl Buffer {
     }
 }
 
+pub struct ImageDescriptor<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub name: &'a str,
+    pub format: vk::Format,
+    pub mip_levels: u32,
+    pub usage: vk::ImageUsageFlags,
+    pub next_accesses: &'a [vk_sync::AccessType],
+    pub next_layout: vk_sync::ImageLayout,
+}
+
 pub struct Image {
     pub image: vk::Image,
     pub allocation: Allocation,
@@ -578,15 +620,20 @@ pub struct Image {
 
 impl Image {
     pub fn new(
-        width: u32,
-        height: u32,
-        name: &str,
-        format: vk::Format,
+        descriptor: &ImageDescriptor,
         init_resources: &mut InitResources,
-        usage: vk::ImageUsageFlags,
-        next_accesses: &[vk_sync::AccessType],
-        next_layout: vk_sync::ImageLayout,
     ) -> anyhow::Result<Self> {
+        let &ImageDescriptor {
+            width,
+            height,
+            name,
+            format,
+            mip_levels,
+            usage,
+            next_accesses,
+            next_layout,
+        } = descriptor;
+
         let image = unsafe {
             init_resources.device.create_image(
                 &vk::ImageCreateInfo::builder()
@@ -597,7 +644,7 @@ impl Image {
                         height,
                         depth: 1,
                     })
-                    .mip_levels(1)
+                    .mip_levels(mip_levels)
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
@@ -622,9 +669,11 @@ impl Image {
                 allocation.memory(),
                 allocation.offset(),
             )?;
-
-            //init_resources.device.set_object_name(image, name)?;
         };
+
+        if let Some(debug_utils_loader) = init_resources.debug_utils_loader {
+            set_object_name(&init_resources.device, debug_utils_loader, image, name)?;
+        }
 
         let subresource_range = *vk::ImageSubresourceRange::builder()
             .aspect_mask(if format == vk::Format::D32_SFLOAT {
@@ -632,19 +681,8 @@ impl Image {
             } else {
                 vk::ImageAspectFlags::COLOR
             })
-            .level_count(1)
+            .level_count(mip_levels)
             .layer_count(1);
-
-        let view = unsafe {
-            init_resources.device.create_image_view(
-                &vk::ImageViewCreateInfo::builder()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(subresource_range),
-                None,
-            )
-        }?;
 
         vk_sync::cmd::pipeline_barrier(
             init_resources.device,
@@ -662,10 +700,21 @@ impl Image {
             }],
         );
 
+        let view = unsafe {
+            init_resources.device.create_image_view(
+                &vk::ImageViewCreateInfo::builder()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(subresource_range),
+                None,
+            )
+        }?;
+
         Ok(Self {
             image,
-            view,
             allocation,
+            view,
         })
     }
 

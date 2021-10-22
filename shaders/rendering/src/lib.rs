@@ -266,12 +266,10 @@ pub fn upsample_final(
     #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
     #[spirv(descriptor_set = 1, binding = 0)] hdr_texture: &Image!(2D, format=rgba16f, sampled=false),
     #[spirv(global_invocation_id)] id: IVec2,
-    #[spirv(push_constant)] scale: &f32,
 ) {
     let (texel_size, uv) = calculate_texel_size_and_uv(hdr_texture, id);
 
-    let sample =
-        sample_3x3_tent_filter((source_texture, sampler), uv, texel_size * *scale, 0).extend(1.0);
+    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size, 0).extend(1.0);
 
     let existing_sample: Vec4 = hdr_texture.read(id);
 
