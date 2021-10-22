@@ -146,14 +146,14 @@ impl DescriptorSetLayouts {
                             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                             .descriptor_count(1)
                             .stage_flags(
-                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
+                                vk::ShaderStageFlags::COMPUTE,
                             ),
                         *vk::DescriptorSetLayoutBinding::builder()
                             .binding(1)
                             .descriptor_type(vk::DescriptorType::SAMPLER)
                             .descriptor_count(1)
                             .stage_flags(
-                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
+                                vk::ShaderStageFlags::COMPUTE,
                             ),
                     ]),
                     None,

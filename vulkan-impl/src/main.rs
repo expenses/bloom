@@ -3,13 +3,16 @@ use ash::extensions::khr::{Surface as SurfaceLoader, Swapchain as SwapchainLoade
 use ash::vk;
 use rendering_shaders::FilterConstants;
 use std::ffi::{CStr, CString};
+use std::mem::ManuallyDrop;
 use ultraviolet::{Mat4, Vec2, Vec3};
+use vulkan_bloom::{
+    bloom_mips_for_dimensions, compute_bloom, prefilter_bloom, BloomTextureWithMips,
+    ComputePipelines, DescriptorSetLayouts,
+};
 use vulkan_common::CStrList;
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::ControlFlow;
 use winit::window::Fullscreen;
-use std::mem::ManuallyDrop;
-use vulkan_bloom::{DescriptorSetLayouts, ComputePipelines, BloomTextureWithMips, prefilter_bloom, compute_bloom, bloom_mips_for_dimensions};
 
 // I get 10 mip levels on a 2560 x 1600 display, so 12 is probably enough even for 4k.
 const MAX_MIPS: u32 = 12;
@@ -114,13 +117,28 @@ fn main() -> anyhow::Result<()> {
         unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }?;
 
     let descriptor_set_layouts = DescriptorSetLayouts::new(&device, MAX_MIPS)?;
+
+    let sampled_texture_dsl = unsafe {
+        device.create_descriptor_set_layout(
+            &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
+                *vk::DescriptorSetLayoutBinding::builder()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                *vk::DescriptorSetLayoutBinding::builder()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            ]),
+            None,
+        )
+    }?;
+
     let render_passes = RenderPasses::new(&device, surface_format.format)?;
-    let graphics_pipelines = GraphicsPipelines::new(
-        &device,
-        &descriptor_set_layouts,
-        &render_passes,
-        pipeline_cache,
-    )?;
+    let graphics_pipelines =
+        GraphicsPipelines::new(&device, sampled_texture_dsl, &render_passes, pipeline_cache)?;
     let compute_pipelines =
         ComputePipelines::new(&device, &descriptor_set_layouts, pipeline_cache)?;
 
@@ -202,7 +220,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut depthbuffer = create_depthbuffer(extent.width, extent.height, &mut init_resources)?;
 
-    let sampled_images = 3;
+    let sampled_images = 4;
     let bloom_textures = 1;
     let storage_textures = 1;
 
@@ -228,7 +246,12 @@ fn main() -> anyhow::Result<()> {
     let mut bloom_mips = bloom_mips_for_dimensions(extent.width, extent.height);
 
     let mut bloom_texture = BloomTextureWithMips::new(
-        BloomImage::new(extent.width / 2, extent.height / 2, bloom_mips, &mut init_resources)?,
+        BloomImage::new(
+            extent.width / 2,
+            extent.height / 2,
+            bloom_mips,
+            &mut init_resources,
+        )?,
         &device,
         bloom_mips,
         MAX_MIPS,
@@ -262,7 +285,8 @@ fn main() -> anyhow::Result<()> {
         device.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::builder()
                 .set_layouts(&[
-                    descriptor_set_layouts.sampled_texture,
+                    sampled_texture_dsl,
+                    sampled_texture_dsl,
                     descriptor_set_layouts.sampled_texture,
                     descriptor_set_layouts.storage_texture,
                 ])
@@ -272,7 +296,8 @@ fn main() -> anyhow::Result<()> {
 
     let descriptor_set = descriptor_sets[0];
     let tonemap_descriptor_set = descriptor_sets[1];
-    let hdr_framebuffer_storage_ds = descriptor_sets[2];
+    let bloom_input_ds = descriptor_sets[2];
+    let hdr_framebuffer_storage_ds = descriptor_sets[3];
 
     unsafe {
         device.update_descriptor_sets(
@@ -298,6 +323,18 @@ fn main() -> anyhow::Result<()> {
                         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
                 *vk::WriteDescriptorSet::builder()
                     .dst_set(tonemap_descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)]),
+                *vk::WriteDescriptorSet::builder()
+                    .dst_set(bloom_input_ds)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&[*vk::DescriptorImageInfo::builder()
+                        .image_view(hdr_framebuffer.view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
+                *vk::WriteDescriptorSet::builder()
+                    .dst_set(bloom_input_ds)
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)]),
@@ -516,6 +553,15 @@ fn main() -> anyhow::Result<()> {
                                 &[
                                     *vk::WriteDescriptorSet::builder()
                                         .dst_set(tonemap_descriptor_set)
+                                        .dst_binding(0)
+                                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                        .image_info(&[*vk::DescriptorImageInfo::builder()
+                                            .image_view(hdr_framebuffer.view)
+                                            .image_layout(
+                                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                            )]),
+                                    *vk::WriteDescriptorSet::builder()
+                                        .dst_set(bloom_input_ds)
                                         .dst_binding(0)
                                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                                         .image_info(&[*vk::DescriptorImageInfo::builder()
@@ -762,7 +808,7 @@ fn main() -> anyhow::Result<()> {
                                 device.cmd_end_render_pass(command_buffer);
 
                                 {
-                                    prefilter_bloom(&device, command_buffer, extent, &bloom_texture, filter_constants, &compute_pipelines, tonemap_descriptor_set);
+                                    prefilter_bloom(&device, command_buffer, extent, &bloom_texture, filter_constants, &compute_pipelines, bloom_input_ds);
 
                                     let subresource_range = *vk::ImageSubresourceRange::builder()
                                         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1009,8 +1055,13 @@ fn create_depthbuffer(
 struct BloomImage(vulkan_common::Image);
 
 impl BloomImage {
-    fn new(width: u32, height: u32, mip_levels: u32, init_resources: &mut vulkan_common::InitResources) -> anyhow::Result<Self> {
-         Ok(Self(vulkan_common::Image::new(
+    fn new(
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        init_resources: &mut vulkan_common::InitResources,
+    ) -> anyhow::Result<Self> {
+        Ok(Self(vulkan_common::Image::new(
             &vulkan_common::ImageDescriptor {
                 width,
                 height,
@@ -1036,7 +1087,11 @@ impl vulkan_bloom::Image for BloomImage {
     }
 }
 
-fn cleanup_bloom_texture(bloom_texture: &BloomTextureWithMips<BloomImage>, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) -> anyhow::Result<()> {
+fn cleanup_bloom_texture(
+    bloom_texture: &BloomTextureWithMips<BloomImage>,
+    device: &ash::Device,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+) -> anyhow::Result<()> {
     bloom_texture.cleanup_image_views(device);
     bloom_texture.image.0.cleanup(device, allocator)
 }
@@ -1156,7 +1211,7 @@ struct GraphicsPipelines {
 impl GraphicsPipelines {
     fn new(
         device: &ash::Device,
-        descriptor_set_layouts: &DescriptorSetLayouts,
+        sampled_texture_dsl: vk::DescriptorSetLayout,
         render_passes: &RenderPasses,
         pipeline_cache: vk::PipelineCache,
     ) -> anyhow::Result<Self> {
@@ -1201,7 +1256,7 @@ impl GraphicsPipelines {
         let general_pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::builder()
-                    .set_layouts(&[descriptor_set_layouts.sampled_texture])
+                    .set_layouts(&[sampled_texture_dsl])
                     .push_constant_ranges(&[*vk::PushConstantRange::builder()
                         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                         .size(128)]),
