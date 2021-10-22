@@ -44,7 +44,10 @@ fn main() -> anyhow::Result<()> {
 
     let instance_extensions = CStrList::new({
         let mut instance_extensions = ash_window::enumerate_required_extensions(&window)?;
-        instance_extensions.push(DebugUtilsLoader::name());
+        instance_extensions.extend(&[
+            DebugUtilsLoader::name(),
+            vk::KhrGetPhysicalDeviceProperties2Fn::name(),
+        ]);
         instance_extensions
     });
 
@@ -52,7 +55,11 @@ fn main() -> anyhow::Result<()> {
         b"VK_LAYER_KHRONOS_validation\0",
     )?]);
 
-    let device_extensions = CStrList::new(vec![SwapchainLoader::name()]);
+    let device_extensions = CStrList::new(vec![
+        SwapchainLoader::name(),
+        vk::ExtDescriptorIndexingFn::name(),
+        vk::KhrMaintenance3Fn::name(),
+    ]);
 
     let mut debug_messenger_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
         .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::all())
@@ -104,11 +111,15 @@ fn main() -> anyhow::Result<()> {
 
         let device_features = vk::PhysicalDeviceFeatures::builder();
 
+        let mut descriptor_indexing_features =
+            vk::PhysicalDeviceDescriptorIndexingFeatures::builder().runtime_descriptor_array(true);
+
         let device_info = vk::DeviceCreateInfo::builder()
             .queue_create_infos(&queue_info)
             .enabled_features(&device_features)
             .enabled_extension_names(device_extensions.pointers())
-            .enabled_layer_names(enabled_layers.pointers());
+            .enabled_layer_names(enabled_layers.pointers())
+            .push_next(&mut descriptor_indexing_features);
 
         unsafe { instance.create_device(physical_device, &device_info, None) }?
     };
@@ -220,14 +231,18 @@ fn main() -> anyhow::Result<()> {
 
     let mut depthbuffer = create_depthbuffer(extent.width, extent.height, &mut init_resources)?;
 
-    let sampled_images = 4;
+    let sampled_images = 2;
     let bloom_textures = 1;
     let storage_textures = 1;
+    let combined_image_samplers = 2;
 
     let descriptor_pool = unsafe {
         device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::builder()
                 .pool_sizes(&[
+                    *vk::DescriptorPoolSize::builder()
+                        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(combined_image_samplers),
                     *vk::DescriptorPoolSize::builder()
                         .ty(vk::DescriptorType::SAMPLED_IMAGE)
                         .descriptor_count(sampled_images),
@@ -238,7 +253,9 @@ fn main() -> anyhow::Result<()> {
                         .ty(vk::DescriptorType::STORAGE_IMAGE)
                         .descriptor_count(bloom_textures * MAX_MIPS + storage_textures),
                 ])
-                .max_sets(sampled_images + bloom_textures + storage_textures),
+                .max_sets(
+                    sampled_images + bloom_textures + storage_textures + combined_image_samplers,
+                ),
             None,
         )
     }?;
@@ -257,7 +274,6 @@ fn main() -> anyhow::Result<()> {
         MAX_MIPS,
         &descriptor_set_layouts,
         descriptor_pool,
-        sampler,
     )?;
 
     drop(init_resources);
@@ -329,15 +345,11 @@ fn main() -> anyhow::Result<()> {
                 *vk::WriteDescriptorSet::builder()
                     .dst_set(bloom_input_ds)
                     .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&[*vk::DescriptorImageInfo::builder()
                         .image_view(hdr_framebuffer.view)
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
-                *vk::WriteDescriptorSet::builder()
-                    .dst_set(bloom_input_ds)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)]),
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .sampler(sampler)]),
                 *vk::WriteDescriptorSet::builder()
                     .dst_set(hdr_framebuffer_storage_ds)
                     .dst_binding(0)
@@ -561,14 +573,12 @@ fn main() -> anyhow::Result<()> {
                                                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                                             )]),
                                     *vk::WriteDescriptorSet::builder()
-                                        .dst_set(bloom_input_ds)
-                                        .dst_binding(0)
-                                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                                        .image_info(&[*vk::DescriptorImageInfo::builder()
-                                            .image_view(hdr_framebuffer.view)
-                                            .image_layout(
-                                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                            )]),
+                    .dst_set(bloom_input_ds)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&[*vk::DescriptorImageInfo::builder()
+                        .image_view(hdr_framebuffer.view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).sampler(sampler)]),
                                     *vk::WriteDescriptorSet::builder()
                                         .dst_set(hdr_framebuffer_storage_ds)
                                         .dst_binding(0)
@@ -1092,7 +1102,7 @@ fn cleanup_bloom_texture(
     device: &ash::Device,
     allocator: &mut gpu_allocator::vulkan::Allocator,
 ) -> anyhow::Result<()> {
-    bloom_texture.cleanup_image_views(device);
+    bloom_texture.cleanup(device);
     bloom_texture.image.0.cleanup(device, allocator)
 }
 
@@ -1259,7 +1269,7 @@ impl GraphicsPipelines {
                     .set_layouts(&[sampled_texture_dsl])
                     .push_constant_ranges(&[*vk::PushConstantRange::builder()
                         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-                        .size(128)]),
+                        .size(std::mem::size_of::<Mat4>() as u32)]),
                 None,
             )
         }?;

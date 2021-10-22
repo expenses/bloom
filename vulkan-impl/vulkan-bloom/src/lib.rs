@@ -1,6 +1,6 @@
 use ash::vk;
-use std::ffi::CStr;
 pub use rendering_shaders::FilterConstants;
+use std::ffi::CStr;
 
 pub struct ComputePipelines {
     pub downsample_initial: vk::Pipeline,
@@ -26,7 +26,7 @@ impl ComputePipelines {
                     ])
                     .push_constant_ranges(&[*vk::PushConstantRange::builder()
                         .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                        .size(128)]),
+                        .size(std::mem::size_of::<FilterConstants>() as u32)]),
                 None,
             )
         }?;
@@ -47,7 +47,7 @@ impl ComputePipelines {
             include_bytes!("../../../shaders/downsample_initial.spv"),
             vk::ShaderStageFlags::COMPUTE,
             device,
-            b"downsample_initial\0"
+            b"downsample_initial\0",
         )?;
 
         let downsample_initial_create_info = vk::ComputePipelineCreateInfo::builder()
@@ -143,18 +143,9 @@ impl DescriptorSetLayouts {
                     &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
                         *vk::DescriptorSetLayoutBinding::builder()
                             .binding(0)
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                             .descriptor_count(1)
-                            .stage_flags(
-                                vk::ShaderStageFlags::COMPUTE,
-                            ),
-                        *vk::DescriptorSetLayoutBinding::builder()
-                            .binding(1)
-                            .descriptor_type(vk::DescriptorType::SAMPLER)
-                            .descriptor_count(1)
-                            .stage_flags(
-                                vk::ShaderStageFlags::COMPUTE,
-                            ),
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
                     ]),
                     None,
                 )?,
@@ -386,6 +377,7 @@ pub struct BloomTextureWithMips<I> {
     pub views: Vec<vk::ImageView>,
     pub storage_mips_descriptor_set: vk::DescriptorSet,
     pub sampled_texture_descriptor_set: vk::DescriptorSet,
+    pub sampler: vk::Sampler,
 }
 
 impl<I: Image> BloomTextureWithMips<I> {
@@ -396,7 +388,6 @@ impl<I: Image> BloomTextureWithMips<I> {
         max_mips: u32,
         descriptor_set_layouts: &DescriptorSetLayouts,
         descriptor_pool: vk::DescriptorPool,
-        sampler: vk::Sampler,
     ) -> anyhow::Result<Self> {
         let descriptor_sets = unsafe {
             device.allocate_descriptor_sets(
@@ -411,17 +402,6 @@ impl<I: Image> BloomTextureWithMips<I> {
 
         let storage_mips_descriptor_set = descriptor_sets[0];
         let sampled_texture_descriptor_set = descriptor_sets[1];
-
-        unsafe {
-            device.update_descriptor_sets(
-                &[*vk::WriteDescriptorSet::builder()
-                    .dst_set(sampled_texture_descriptor_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&[*vk::DescriptorImageInfo::builder().sampler(sampler)])],
-                &[],
-            );
-        }
 
         Self::new_with_existing_sets(
             image,
@@ -441,6 +421,18 @@ impl<I: Image> BloomTextureWithMips<I> {
         storage_mips_descriptor_set: vk::DescriptorSet,
         sampled_texture_descriptor_set: vk::DescriptorSet,
     ) -> anyhow::Result<Self> {
+        let sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::builder()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .max_lod(vk::LOD_CLAMP_NONE),
+                None,
+            )
+        }?;
+
         let views = (0..mip_levels)
             .map(|i| {
                 let subresource_range = *vk::ImageSubresourceRange::builder()
@@ -484,10 +476,11 @@ impl<I: Image> BloomTextureWithMips<I> {
                     *vk::WriteDescriptorSet::builder()
                         .dst_set(sampled_texture_descriptor_set)
                         .dst_binding(0)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .image_info(&[*vk::DescriptorImageInfo::builder()
                             .image_view(image.vk_image_view())
-                            .image_layout(vk::ImageLayout::GENERAL)]),
+                            .image_layout(vk::ImageLayout::GENERAL)
+                            .sampler(sampler)]),
                 ],
                 &[],
             );
@@ -498,18 +491,18 @@ impl<I: Image> BloomTextureWithMips<I> {
             views,
             storage_mips_descriptor_set,
             sampled_texture_descriptor_set,
+            sampler,
         })
     }
 
-    pub fn cleanup_image_views(
-        &self,
-        device: &ash::Device,
-    ) {
+    pub fn cleanup(&self, device: &ash::Device) {
         for view in &self.views {
             unsafe {
                 device.destroy_image_view(*view, None);
             }
         }
+
+        unsafe { device.destroy_sampler(self.sampler, None) }
     }
 }
 

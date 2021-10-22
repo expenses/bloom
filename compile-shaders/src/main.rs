@@ -1,9 +1,9 @@
 use spirv_builder::{Capability, MetadataPrintout, SpirvBuilder};
 
 fn main() -> anyhow::Result<()> {
-    let extensions = &[];
+    let extensions = &["SPV_EXT_descriptor_indexing"];
 
-    let capabilities = &[Capability::ImageQuery];
+    let capabilities = &[Capability::ImageQuery, Capability::RuntimeDescriptorArray];
 
     compile_shader_multi("shaders/rendering", extensions, capabilities)?;
 
