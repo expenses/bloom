@@ -87,13 +87,13 @@ dependencies = [
 [[package]]
 name = "ash-opinionated-abstractions"
 version = "0.1.0"
-source = "git+https://github.com/expenses/ash-opinionated-abstractions#f3efb249d1b28c92b4deda0d12d16bb367647e51"
+source = "git+https://github.com/expenses/ash-opinionated-abstractions#e659014aaa6e6d074d8032236a05f9e636c115d8"
 dependencies = [
  "anyhow",
  "ash",
  "gpu-allocator",
  "log",
- "vk-sync",
+ "vk-sync-fork",
 ]
 
 [[package]]
@@ -172,7 +172,7 @@ dependencies = [
  "rendering-shaders",
  "simplelog",
  "ultraviolet",
- "vk-sync",
+ "vk-sync-fork",
  "vulkan-bloom",
  "winit",
 ]
@@ -1854,9 +1854,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fecdca9a5291cc2b8dcf7dc02453fee791a280f3743cb0905f8822ae463b3fe"
 
 [[package]]
-name = "vk-sync"
-version = "0.1.6"
-source = "git+https://github.com/expenses/vk-sync-rs#cc7b7a5ba1fe1b7383f2ca3380667943cb008e63"
+name = "vk-sync-fork"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec4933d9b2bc41211cb06994a367c20cf33d39b0450b3763a2c502956036c92"
 dependencies = [
  "ash",
 ]
@@ -1869,7 +1870,7 @@ dependencies = [
  "ash",
  "bytemuck",
  "rendering-shaders",
- "vk-sync",
+ "vk-sync-fork",
 ]
 
 [[package]]

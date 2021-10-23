@@ -574,12 +574,13 @@ fn main() -> anyhow::Result<()> {
                                                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                                             )]),
                                     *vk::WriteDescriptorSet::builder()
-                    .dst_set(bloom_input_ds)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&[*vk::DescriptorImageInfo::builder()
-                        .image_view(hdr_framebuffer.view)
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).sampler(sampler)]),
+                                        .dst_set(bloom_input_ds)
+                                        .dst_binding(0)
+                                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                        .image_info(&[*vk::DescriptorImageInfo::builder()
+                                            .image_view(hdr_framebuffer.view)
+                                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                                            .sampler(sampler)]),
                                     *vk::WriteDescriptorSet::builder()
                                         .dst_set(hdr_framebuffer_storage_ds)
                                         .dst_binding(0)
@@ -1282,7 +1283,7 @@ impl GraphicsPipelines {
                 primitive_state: vulkan_common::PrimitiveState {
                     cull_mode: vk::CullModeFlags::BACK,
                     topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                    polygon_mode: vk::PolygonMode::FILL
+                    polygon_mode: vk::PolygonMode::FILL,
                 },
                 depth_stencil_state: Some(vulkan_common::DepthStencilState {
                     depth_test_enable: true,
@@ -1317,7 +1318,7 @@ impl GraphicsPipelines {
                 primitive_state: vulkan_common::PrimitiveState {
                     cull_mode: vk::CullModeFlags::NONE,
                     topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                    polygon_mode: vk::PolygonMode::FILL
+                    polygon_mode: vk::PolygonMode::FILL,
                 },
                 depth_stencil_state: None,
                 vertex_attributes: &[],
