@@ -68,9 +68,6 @@ pub fn fullscreen_tri(
     let pos = 2.0 * *uv - Vec2::ONE;
 
     *builtin_pos = Vec4::new(pos.x, pos.y, 0.0, 1.0);
-
-    // Flipped on Y for webgpu.
-    uv.y = 1.0 - uv.y;
 }
 
 // This is just lifted from
@@ -159,8 +156,9 @@ pub struct FilterConstants {
 // Sample and filter the input HDR texture into the 0th half-size mip of the bloom texture.
 #[spirv(compute(threads(8, 8)))]
 pub fn downsample_initial(
-    #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &Image!(2D, type=f32, sampled),
-    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(descriptor_set = 0, binding = 0)] hdr_texture: &SampledImage<
+        Image!(2D, type=f32, sampled),
+    >,
     #[spirv(descriptor_set = 1, binding = 0)] bloom_texture_mips: &RuntimeArray<
         Image!(2D, format=rgba16f, sampled=false),
     >,
@@ -173,7 +171,7 @@ pub fn downsample_initial(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(bloom_texture, id);
 
-    let sample = sample_13_tap_box_filter((hdr_texture, sampler), uv, texel_size, 0);
+    let sample = sample_13_tap_box_filter(hdr_texture, uv, texel_size, 0);
 
     // Threshold the colours based on a quadratic curve set by the constants.
     // An alternative to doing this (and what's used in the original presentation)
@@ -192,8 +190,9 @@ pub fn downsample_initial(
 // Sample the bloom texture at mip N and write to mip N + 1.
 #[spirv(compute(threads(8, 8)))]
 pub fn downsample(
-    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
-    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &SampledImage<
+        Image!(2D, type=f32, sampled),
+    >,
     #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
         Image!(2D, format=rgba16f, sampled=false),
     >,
@@ -206,8 +205,7 @@ pub fn downsample(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(destination_texture, id);
 
-    let sample = sample_13_tap_box_filter((source_texture, sampler), uv, texel_size, *source_mip)
-        .extend(1.0);
+    let sample = sample_13_tap_box_filter(source_texture, uv, texel_size, *source_mip).extend(1.0);
 
     unsafe {
         destination_texture.write(id, sample);
@@ -217,8 +215,9 @@ pub fn downsample(
 // Sample the bloom texture at mip N + 1, perform additive blending with the texture at mip N and write to mip N.
 #[spirv(compute(threads(8, 8)))]
 pub fn upsample(
-    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
-    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &SampledImage<
+        Image!(2D, type=f32, sampled),
+    >,
     #[spirv(descriptor_set = 1, binding = 0)] destination_textures: &RuntimeArray<
         Image!(2D, format=rgba16f, sampled=false),
     >,
@@ -231,8 +230,7 @@ pub fn upsample(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(destination_texture, id);
 
-    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size, dest_mip + 1)
-        .extend(1.0);
+    let sample = sample_3x3_tent_filter(source_texture, uv, texel_size, dest_mip + 1).extend(1.0);
 
     let existing_sample: Vec4 = destination_texture.read(id);
 
@@ -244,8 +242,9 @@ pub fn upsample(
 // Sample the bloom texture for a final time at the 0th mip and perform additive blending with the hdr texture.
 #[spirv(compute(threads(8, 8)))]
 pub fn upsample_final(
-    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &Image!(2D, type=f32, sampled),
-    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(descriptor_set = 0, binding = 0)] source_texture: &SampledImage<
+        Image!(2D, type=f32, sampled),
+    >,
     #[spirv(descriptor_set = 1, binding = 0)] hdr_texture: &Image!(2D, format=rgba16f, sampled=false),
     #[spirv(global_invocation_id)] id: IVec3,
 ) {
@@ -253,7 +252,7 @@ pub fn upsample_final(
 
     let (texel_size, uv) = calculate_texel_size_and_uv(hdr_texture, id);
 
-    let sample = sample_3x3_tent_filter((source_texture, sampler), uv, texel_size, 0).extend(1.0);
+    let sample = sample_3x3_tent_filter(source_texture, uv, texel_size, 0).extend(1.0);
 
     let existing_sample: Vec4 = hdr_texture.read(id);
 
