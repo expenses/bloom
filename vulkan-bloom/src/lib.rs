@@ -110,6 +110,17 @@ impl ComputePipelines {
             upsample_final_pipeline_layout,
         })
     }
+
+    pub fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_pipeline(self.downsample_initial, None);
+            device.destroy_pipeline(self.downsample, None);
+            device.destroy_pipeline(self.upsample, None);
+            device.destroy_pipeline(self.upsample_final, None);
+            device.destroy_pipeline_layout(self.bloom_pipeline_layout, None);
+            device.destroy_pipeline_layout(self.upsample_final_pipeline_layout, None);
+        }
+    }
 }
 
 fn load_shader_module_as_stage<'a>(
