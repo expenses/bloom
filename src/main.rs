@@ -461,8 +461,6 @@ fn main() -> anyhow::Result<()> {
         surface_format,
     ));
 
-    let mut allocator = ManuallyDrop::new(allocator);
-
     event_loop.run(move |event, _, control_flow| {
         egui_integration.handle_event(&event);
 
@@ -975,12 +973,11 @@ fn main() -> anyhow::Result<()> {
                         vertex_buffer.cleanup(&device, &mut allocator)?;
                         index_buffer.cleanup(&device, &mut allocator)?;
                         cleanup_bloom_texture(&bloom_texture, &device, &mut allocator)?;
+                        //compute_pipelines.destroy(&device);
                     }
 
                     unsafe {
                         egui_integration.destroy();
-
-                        ManuallyDrop::drop(&mut allocator);
                         ManuallyDrop::drop(&mut egui_integration);
                     }
                 }
